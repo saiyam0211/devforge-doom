@@ -120,7 +120,7 @@ class DoomExpertTeacher:
             if min_door_d < 0.08:
                 # Within DOOM use range (64 units = 0.0625) -> Press USE!
                 act[7] = 1
-                self.door_timer = 10  # Charge forward through rising door
+                self.door_timer = 15  # Charge forward through rising door aperture (15 steps = 60 tics)
             else:
                 act[0] = 1  # Walk towards door
                 if best_door_r != 0:
@@ -442,12 +442,15 @@ def main():
         (two_rooms_path, "MAP01"),
         (two_rooms_path, "MAP01"),
         (two_rooms_path, "MAP01"),
+        (two_rooms_path, "MAP01"),
         (freedoom2_path, "MAP01"),
         (freedoom2_path, "MAP02"),
         (freedoom2_path, "MAP03"),
         (freedoom2_path, "MAP04"),
         (freedoom2_path, "MAP05"),
         (freedoom2_path, "MAP06"),
+        (freedoom2_path, "MAP07"),
+        (freedoom2_path, "MAP08"),
     ]
 
     # 1. Collect Demonstrations

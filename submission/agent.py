@@ -101,13 +101,14 @@ class DoomAgent:
 
             action = action_tensor[0].cpu().numpy().astype(np.int8)
 
-            # Prevent DOOM USE spamming: pulse USE and enforce a 3-step (12-tic) cooldown
+            # Prevent DOOM USE spamming: pulse USE and enforce a 15-step (60-tic) door-opening cooldown
+            # In DOOM engine physics, pressing USE on an opening door immediately halts and reverses it.
             if action[7] == 1:
                 if self.use_cooldown > 0:
                     action[7] = 0
                     self.use_cooldown -= 1
                 else:
-                    self.use_cooldown = 3
+                    self.use_cooldown = 15
             elif self.use_cooldown > 0:
                 self.use_cooldown -= 1
 
