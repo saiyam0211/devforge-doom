@@ -288,7 +288,7 @@ def collect_demonstrations(
             ep_steps += 1
             total_steps += 1
 
-            if priv["exit_reached"]:
+            if info.get("exit_reached", False):
                 total_exits += 1
 
             if term or trunc:
