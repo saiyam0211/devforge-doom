@@ -46,19 +46,22 @@ from submission.model import SpatialEgoNet
 # 1. Algorithmic Expert Teacher
 # -----------------------------------------------------------------------------
 class DoomExpertTeacher:
-    """Algorithmic teacher operating strictly during training to generate expert demonstrations."""
+    """Algorithmic teacher operating strictly during training to generate expert demonstrations.
+    
+    Includes calibrated door aperture interaction, committed stuck recovery,
+    keycard collection, and combat target engagement.
+    """
 
     def __init__(self):
-        self.door_opening_timer = 0
-        self.charging_through = 0
-        self.stuck_steps = 0
-        self.step_idx = 0
+        self.reset()
 
     def reset(self):
-        self.door_opening_timer = 0
-        self.charging_through = 0
-        self.stuck_steps = 0
         self.step_idx = 0
+        self.stuck_steps = 0
+        self.escape_turn_steps = 0
+        self.escape_dir = 1  # 1: left, 2: right
+        self.door_timer = 0
+        self.last_act_fwd = 0
 
     def act(self, obs: Dict[str, Any], priv: Dict[str, Any] | None = None) -> np.ndarray:
         self.step_idx += 1
@@ -68,39 +71,20 @@ class DoomExpertTeacher:
         vitals = obs["vitals"]
         entities = obs["visible_entities"]
 
-        front_d = rays[0]
-        vel_fwd = vitals[14]
-        hp = vitals[0]
+        front_d = float(rays[0])
+        vel_fwd = float(vitals[14])
+        hp = float(vitals[0])
 
-        # Stuck detection: bumping against wall or stationary while attempting forward
-        if front_d < 0.10 or (vel_fwd < 0.8 and front_d < 0.20):
+        # Stuck detection: ONLY when attempting forward movement but blocked
+        if self.last_act_fwd and (vel_fwd < 0.5 or front_d < 0.08) and self.step_idx > 5:
             self.stuck_steps += 1
         else:
-            self.stuck_steps = max(0, self.stuck_steps - 1)
+            self.stuck_steps = 0
 
-        # A. Door Interaction & Aperture Passage
-        front_door = any(hits[r] in (2, 3) and rays[r] < 0.25 for r in [0, 1, 63, 2, 62, 3, 61])
-        if front_door and self.door_opening_timer == 0 and self.charging_through == 0:
-            act[7] = 1  # USE
-            self.door_opening_timer = 8  # Wait for door to rise to player height
-            return act
-
-        if self.door_opening_timer > 0:
-            self.door_opening_timer -= 1
-            if self.door_opening_timer == 0:
-                self.charging_through = 15
-            return act
-
-        if self.charging_through > 0:
-            self.charging_through -= 1
-            act[0] = 1  # March forward through doorway!
-            return act
-
+        # A. Keycard Acquisition (Top Priority for Progression)
         mask = entities["mask"]
         types = entities["entity_type"]
         feats = entities["features"]
-
-        # B. Keycard Acquisition (Top Priority for Progression)
         key_idx = [i for i in range(len(mask)) if mask[i] == 1 and types[i] == 9]
         if key_idx:
             best_k = min(key_idx, key=lambda i: feats[i, 0])
@@ -111,10 +95,11 @@ class DoomExpertTeacher:
                     act[4] = 1  # Turn left
                 else:
                     act[5] = 1  # Turn right
+            self.last_act_fwd = act[0]
             return act
 
-        # C. Urgent Health / Armor Collection if low HP
-        if hp < 70:
+        # B. Urgent Health Collection if low HP
+        if hp < 60:
             health_items = [i for i in range(len(mask)) if mask[i] == 1 and types[i] in (5, 6)]
             if health_items:
                 best_h = min(health_items, key=lambda i: feats[i, 0])
@@ -124,7 +109,33 @@ class DoomExpertTeacher:
                     act[4] = 1
                 elif sin_h < -0.05:
                     act[5] = 1
+                self.last_act_fwd = act[0]
                 return act
+
+        # C. Door Interaction & Aperture Passage
+        door_rays = [r for r in list(range(58, 64)) + list(range(0, 7)) if hits[r] in (2, 3)]
+        if door_rays:
+            min_door_d = min(rays[r] for r in door_rays)
+            best_door_r = min(door_rays, key=lambda r: rays[r])
+            if min_door_d < 0.08:
+                # Within DOOM use range (64 units = 0.0625) -> Press USE!
+                act[7] = 1
+                self.door_timer = 10  # Charge forward through rising door
+            else:
+                act[0] = 1  # Walk towards door
+                if best_door_r != 0:
+                    if best_door_r < 32:
+                        act[4] = 1
+                    else:
+                        act[5] = 1
+                self.last_act_fwd = act[0]
+                return act
+
+        if self.door_timer > 0:
+            self.door_timer -= 1
+            act[0] = 1  # Charge through doorway aperture
+            self.last_act_fwd = act[0]
+            return act
 
         # D. Tactical Combat: Aim, Fire, and Strafe-Dodge Visible Monsters
         enemy_idx = [i for i in range(len(mask)) if mask[i] == 1 and types[i] in (1, 2, 3)]
@@ -133,7 +144,7 @@ class DoomExpertTeacher:
             dist = feats[best_e, 0]  # distance / 1024.0
             sin_a = feats[best_e, 1]
 
-            if abs(sin_a) < 0.18:
+            if abs(sin_a) < 0.20:
                 act[6] = 1  # ATTACK!
 
             if sin_a > 0.04:
@@ -141,48 +152,47 @@ class DoomExpertTeacher:
             elif sin_a < -0.04:
                 act[5] = 1  # Turn right to center target
 
-            # Strafe dodge left and right periodically to avoid incoming fireballs/bullets
+            # Strafe dodge left and right periodically
             if (self.step_idx // 8) % 2 == 0:
                 act[2] = 1  # Strafe left
             else:
                 act[3] = 1  # Strafe right
 
-            if dist > 0.22:
+            if dist > 0.20:
                 act[0] = 1  # Approach enemy
             elif dist < 0.12:
                 act[1] = 1  # Back up slightly if monster is right in face
+            self.last_act_fwd = act[0]
             return act
 
-        # E. Stuck Recovery: Dislodge from obstacles and solid walls
-        if self.stuck_steps >= 2:
-            act[1] = 1  # Back up away from wall!
-            best_r = int(np.argmax(rays))
-            if best_r < 32:
-                act[4] = 1  # Turn left toward max clearance
+        # E. Committed Stuck Recovery (Prevents 2-state periodic limit cycles)
+        if self.escape_turn_steps > 0:
+            self.escape_turn_steps -= 1
+            act[1] = 1  # Back up
+            if self.escape_dir == 1:
+                act[4] = 1  # Turn left
             else:
-                act[5] = 1  # Turn right toward max clearance
-            if self.stuck_steps >= 5:
-                act[2] = 1  # Strafe to break corner collision latching
+                act[5] = 1  # Turn right
+            self.last_act_fwd = act[0]
             return act
 
-        # F. Door Attraction: If closed door is in view, steer towards it
-        door_rays = [r for r, h in enumerate(hits) if h in (2, 3) and rays[r] < 0.8]
-        if door_rays:
-            best_door = min(door_rays, key=lambda r: rays[r])
-            if best_door != 0:
-                if best_door < 32:
-                    act[4] = 1  # Turn left
-                else:
-                    act[5] = 1  # Turn right
-            if front_d > 0.14:
-                act[0] = 1  # Move forward
+        if self.stuck_steps >= 2:
+            self.escape_turn_steps = 8  # Commit to 8 steps of continuous turning
+            best_r = int(np.argmax(rays))
+            self.escape_dir = 1 if best_r < 32 else 2
+            act[1] = 1  # Back up
+            if self.escape_dir == 1:
+                act[4] = 1
+            else:
+                act[5] = 1
+            self.last_act_fwd = act[0]
             return act
 
-        # G. Spatial Exploration: Seek Maximum Clearance Angle
+        # F. Spatial Exploration: Seek Maximum Clearance Angle
         front_cone = list(range(58, 64)) + list(range(0, 7))
         best_front = front_cone[int(np.argmax([rays[r] for r in front_cone]))]
 
-        if front_d > 0.14:
+        if front_d > 0.12:
             act[0] = 1  # Move forward
             if best_front != 0:
                 if best_front < 32:
@@ -196,9 +206,10 @@ class DoomExpertTeacher:
                 act[4] = 1
             else:
                 act[5] = 1
-            if front_d < 0.08:
+            if front_d < 0.06:
                 act[1] = 1  # Back up slightly
 
+        self.last_act_fwd = act[0]
         return act
 
 
