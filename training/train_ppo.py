@@ -330,7 +330,8 @@ def run_training_loop(
     ppo_epochs: int = 4,
     device: str = "cpu",
     output_weights: Optional[Path] = None,
-) -> None:
+    trainer: Optional[PPOTrainer] = None,
+) -> PPOTrainer:
     """Executes vectorized PPO training loop with progressive evaluation logging."""
     wad_path = resolve_wad_path(wad_name)
     print(f"\n=======================================================")
@@ -340,11 +341,11 @@ def run_training_loop(
     print(f"=======================================================")
 
     env = make_env(wad_path, map_name, episode_ticks=2100)
-    trainer = PPOTrainer(device=device)
-
     weights_file = output_weights or (ROOT / "submission" / "weights" / "agent_weights.pt")
-    if weights_file.is_file():
-        trainer.load_checkpoint(weights_file)
+    if trainer is None:
+        trainer = PPOTrainer(device=device)
+        if weights_file.is_file():
+            trainer.load_checkpoint(weights_file)
 
     shaper = DoomRewardShaper()
     curr_obs, _ = env.reset()
@@ -422,11 +423,13 @@ def run_training_loop(
     total_time = time.time() - start_time
     print(f"\n[Training Complete] {total_steps_done} steps finished in {total_time:.1f}s.")
     print(f"[Training Complete] Policy weights exported to: {weights_file}")
+    return trainer
 
 
 def run_curriculum_rotation(
     map_list: List[str],
     steps_per_map: int = 1024,
+    rounds: int = 1,
     rollout_len: int = 256,
     batch_size: int = 64,
     ppo_epochs: int = 4,
@@ -442,25 +445,29 @@ def run_curriculum_rotation(
     print(f"\n=======================================================")
     print(f" Starting Multi-Map DOOM Curriculum Rotation")
     print(f" Maps: {map_list}")
-    print(f" Steps/Map: {steps_per_map} | Device: {device}")
+    print(f" Rounds: {rounds} | Steps/Map: {steps_per_map} | Device: {device}")
     print(f"=======================================================")
 
-    for map_spec in map_list:
-        if ":" in map_spec:
-            wad_part, map_part = map_spec.split(":", 1)
-        else:
-            wad_part, map_part = map_spec, "MAP01"
+    for r in range(1, rounds + 1):
+        print(f"\n>>> [Curriculum Round {r}/{rounds}] Starting across {len(map_list)} maps...")
+        for idx, map_spec in enumerate(map_list, 1):
+            if ":" in map_spec:
+                wad_part, map_part = map_spec.split(":", 1)
+            else:
+                wad_part, map_part = map_spec, "MAP01"
 
-        run_training_loop(
-            wad_name=wad_part,
-            map_name=map_part,
-            total_steps=steps_per_map,
-            rollout_len=rollout_len,
-            batch_size=batch_size,
-            ppo_epochs=ppo_epochs,
-            device=device,
-            output_weights=weights_file,
-        )
+            print(f"\n--- Round {r} | Map {idx}/{len(map_list)}: {wad_part}:{map_part} ---")
+            trainer = run_training_loop(
+                wad_name=wad_part,
+                map_name=map_part,
+                total_steps=steps_per_map,
+                rollout_len=rollout_len,
+                batch_size=batch_size,
+                ppo_epochs=ppo_epochs,
+                device=device,
+                output_weights=weights_file,
+                trainer=trainer,
+            )
 
 
 def main():
@@ -469,6 +476,7 @@ def main():
     parser.add_argument("--wad", type=str, default="maps/two_rooms.wad", help="WAD file path or name")
     parser.add_argument("--map", type=str, default="MAP01", help="Map name within WAD")
     parser.add_argument("--maps", nargs="*", default=None, help="List of maps (wad:map) for curriculum rotation")
+    parser.add_argument("--rounds", type=int, default=1, help="Number of curriculum rotation rounds")
     parser.add_argument("--steps", type=int, default=2000, help="Total environment steps")
     parser.add_argument("--rollout", type=int, default=256, help="Rollout length per PPO iteration")
     parser.add_argument("--batch-size", type=int, default=64, help="Minibatch size for PPO updates")
@@ -480,6 +488,7 @@ def main():
         run_curriculum_rotation(
             map_list=args.maps,
             steps_per_map=args.steps,
+            rounds=args.rounds,
             rollout_len=args.rollout,
             batch_size=args.batch_size,
             ppo_epochs=args.epochs,
