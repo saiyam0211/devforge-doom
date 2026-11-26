@@ -424,11 +424,51 @@ def run_training_loop(
     print(f"[Training Complete] Policy weights exported to: {weights_file}")
 
 
+def run_curriculum_rotation(
+    map_list: List[str],
+    steps_per_map: int = 1024,
+    rollout_len: int = 256,
+    batch_size: int = 64,
+    ppo_epochs: int = 4,
+    device: str = "cpu",
+    output_weights: Optional[Path] = None,
+) -> None:
+    """Executes multi-map curriculum rotation to train universal texture-invariant spatial policy."""
+    weights_file = output_weights or (ROOT / "submission" / "weights" / "agent_weights.pt")
+    trainer = PPOTrainer(device=device)
+    if weights_file.is_file():
+        trainer.load_checkpoint(weights_file)
+
+    print(f"\n=======================================================")
+    print(f" Starting Multi-Map DOOM Curriculum Rotation")
+    print(f" Maps: {map_list}")
+    print(f" Steps/Map: {steps_per_map} | Device: {device}")
+    print(f"=======================================================")
+
+    for map_spec in map_list:
+        if ":" in map_spec:
+            wad_part, map_part = map_spec.split(":", 1)
+        else:
+            wad_part, map_part = map_spec, "MAP01"
+
+        run_training_loop(
+            wad_name=wad_part,
+            map_name=map_part,
+            total_steps=steps_per_map,
+            rollout_len=rollout_len,
+            batch_size=batch_size,
+            ppo_epochs=ppo_epochs,
+            device=device,
+            output_weights=weights_file,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="PPO Training Pipeline for DOOM")
     parser.add_argument("--phase", type=str, default="nav_exploration", choices=[p.value for p in TrainingPhase])
     parser.add_argument("--wad", type=str, default="maps/two_rooms.wad", help="WAD file path or name")
     parser.add_argument("--map", type=str, default="MAP01", help="Map name within WAD")
+    parser.add_argument("--maps", nargs="*", default=None, help="List of maps (wad:map) for curriculum rotation")
     parser.add_argument("--steps", type=int, default=2000, help="Total environment steps")
     parser.add_argument("--rollout", type=int, default=256, help="Rollout length per PPO iteration")
     parser.add_argument("--batch-size", type=int, default=64, help="Minibatch size for PPO updates")
@@ -436,15 +476,25 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
-    run_training_loop(
-        wad_name=args.wad,
-        map_name=args.map,
-        total_steps=args.steps,
-        rollout_len=args.rollout,
-        batch_size=args.batch_size,
-        ppo_epochs=args.epochs,
-        device=args.device,
-    )
+    if args.maps:
+        run_curriculum_rotation(
+            map_list=args.maps,
+            steps_per_map=args.steps,
+            rollout_len=args.rollout,
+            batch_size=args.batch_size,
+            ppo_epochs=args.epochs,
+            device=args.device,
+        )
+    else:
+        run_training_loop(
+            wad_name=args.wad,
+            map_name=args.map,
+            total_steps=args.steps,
+            rollout_len=args.rollout,
+            batch_size=args.batch_size,
+            ppo_epochs=args.epochs,
+            device=args.device,
+        )
 
 
 if __name__ == "__main__":

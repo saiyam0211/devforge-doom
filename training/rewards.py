@@ -94,7 +94,44 @@ class DoomRewardShaper:
             breakdown["key"] = key_r
             self.last_keys = curr_keys
 
-        # 4. Exit Reached
+        # 4. Door interaction incentive: reward USE when facing a door closely
+        front_ray_dist = obs["rays"]["distance"][0]
+        front_ray_hit = obs["rays"]["hit_type"][0]
+        is_door_ahead = front_ray_hit in (2, 3)  # door or locked_door
+        is_close_to_door = front_ray_dist < 0.20  # within ~200 map units
+        if is_door_ahead and is_close_to_door and action[7] == 1:
+            door_r = 1.5
+            reward += door_r
+            breakdown["door_use"] = door_r
+
+        # 5. Combat tactical alignment: reward shooting when enemy is targeted
+        ent_mask = obs["visible_entities"]["mask"]
+        ent_types = obs["visible_entities"]["entity_type"]
+        ent_feats = obs["visible_entities"]["features"]
+        has_visible_enemy = False
+        enemy_in_crosshair = False
+
+        if np.any(ent_mask == 1):
+            for i in range(len(ent_mask)):
+                if ent_mask[i] == 1 and ent_types[i] in (1, 2, 3):  # enemy_melee, enemy_hitscan, enemy_projectile
+                    has_visible_enemy = True
+                    sin_angle = abs(ent_feats[i, 1])
+                    if sin_angle < 0.25:  # within ~14 degrees of center
+                        enemy_in_crosshair = True
+                    break
+
+        if action[6] == 1:  # ATTACK
+            if enemy_in_crosshair:
+                combat_r = 0.5
+                reward += combat_r
+                breakdown["combat_hit"] = combat_r
+            elif not has_visible_enemy:
+                # Slight penalty for wasting ammo against empty walls
+                ammo_p = -0.02
+                reward += ammo_p
+                breakdown["ammo_waste"] = ammo_p
+
+        # 6. Exit Reached
         if info.get("exit_reached", False) or info.get("success", False):
             reward += self.exit_reward
             breakdown["exit"] = self.exit_reward
