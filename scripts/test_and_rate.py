@@ -39,6 +39,8 @@ def resolve_wad_path(wad_spec: str) -> str:
         return str(p.resolve())
     if (ROOT / wad_spec).is_file():
         return str((ROOT / wad_spec).resolve())
+    if (ROOT / "maps" / wad_spec).is_file():
+        return str((ROOT / "maps" / wad_spec).resolve())
     try:
         candidate = Path(vd.__path__[0]) / wad_spec
         if candidate.is_file():
