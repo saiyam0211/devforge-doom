@@ -45,30 +45,46 @@ def resolve_wad_path(wad_spec: str) -> str:
         candidate = Path(vd.__path__[0]) / wad_spec
         if candidate.is_file():
             return str(candidate.resolve())
+        candidate_scen = Path(vd.__path__[0]) / "scenarios" / wad_spec
+        if candidate_scen.is_file():
+            return str(candidate_scen.resolve())
     except ImportError:
         pass
     raise FileNotFoundError(f"Cannot resolve WAD: {wad_spec}")
 
 
-class LiveDoomEnv(DoomEnv):
-    """Subclass of DoomEnv supporting visible window mode for desktop viewing."""
+SKILL_NAMES = {
+    1: "I'm Too Young To Die (Easy)",
+    2: "Hey, Not Too Rough (Medium-Low)",
+    3: "Hurt Me Plenty (Standard Evaluation)",
+    4: "Ultra-Violence (Hard Difficulty)",
+    5: "Nightmare (Extreme Difficulty)",
+}
 
-    def __init__(self, wad: str, map_name: str = "MAP01", visible: bool = False, **kwargs):
+
+class LiveDoomEnv(DoomEnv):
+    """Subclass of DoomEnv supporting visible window mode and configurable difficulty."""
+
+    def __init__(self, wad: str, map_name: str = "MAP01", visible: bool = False, skill: int = SKILL, **kwargs):
         super().__init__(wad, map_name, **kwargs)
-        if visible:
+        self.skill = skill
+        if visible or skill != SKILL:
             self._game.close()
             g = vd.DoomGame()
             g.set_doom_game_path(IWAD)
             g.set_doom_scenario_path(self.wad)
             g.set_doom_map(self.map_name)
-            g.set_doom_skill(SKILL)
+            g.set_doom_skill(skill)
             g.set_mode(vd.Mode.PLAYER)
-            g.set_window_visible(True)
+            g.set_window_visible(visible)
             g.set_sound_enabled(False)
-            g.set_screen_resolution(vd.ScreenResolution.RES_640X480)
+            if visible:
+                g.set_screen_resolution(vd.ScreenResolution.RES_640X480)
+            else:
+                g.set_screen_resolution(vd.ScreenResolution.RES_160X120)
             g.set_screen_format(vd.ScreenFormat.RGB24)
             g.set_depth_buffer_enabled(True)
-            g.set_render_hud(True)
+            g.set_render_hud(visible)
             g.set_render_weapon(True)
             g.set_render_corpses(True)
             g.set_objects_info_enabled(True)
@@ -87,14 +103,17 @@ def run_rulebook_test(
     visible: bool = False,
     device: str = "cpu",
     seed: int | None = 0,
+    skill: int = 3,
 ) -> Dict[str, Any]:
     wad_path = resolve_wad_path(wad_name)
+    skill_str = SKILL_NAMES.get(skill, f"Skill {skill}")
     print(f"\n=======================================================")
     print(f" DevForge Rulebook Test: {Path(wad_path).name}:{map_name} (Seed: {seed})")
-    print(f" Episode Cap: {episode_ticks} tics (525 steps) | Window: {visible}")
+    print(f" Difficulty: {skill_str}")
+    print(f" Episode Cap: {episode_ticks} tics ({episode_ticks // S.FRAME_SKIP} steps) | Window: {visible}")
     print(f"=======================================================")
 
-    env = LiveDoomEnv(wad_path, map_name=map_name, visible=visible, episode_ticks=episode_ticks)
+    env = LiveDoomEnv(wad_path, map_name=map_name, visible=visible, episode_ticks=episode_ticks, skill=skill)
     agent = DoomAgent(env.observation_space, env.action_space, device=device)
 
     obs, info = env.reset(seed=seed) if seed is not None else env.reset()
@@ -224,6 +243,7 @@ def main():
     parser.add_argument("--window", action="store_true", help="Open native window on desktop for live visual viewing")
     parser.add_argument("--device", type=str, default="cpu", help="PyTorch device")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for environment reset (default: 0)")
+    parser.add_argument("--skill", type=int, default=3, choices=[1, 2, 3, 4, 5], help="Doom skill: 1 (easy) to 5 (nightmare), default 3, 4 is Ultra-Violence (Hard)")
     args = parser.parse_args()
 
     res = run_rulebook_test(
@@ -233,12 +253,13 @@ def main():
         visible=args.window,
         device=args.device,
         seed=args.seed,
+        skill=args.skill,
     )
 
     print("\n" + "=" * 70)
     print(" DEVFORGE TRACK 1: OFFICIAL SCORECARD & RATING")
     print("=" * 70)
-    print(f" Environment         : {res['wad']}:{res['map']}")
+    print(f" Environment         : {res['wad']}:{res['map']} (Skill {args.skill}: {SKILL_NAMES.get(args.skill, '')})")
     print(f" Steps Survived      : {res['steps']} steps ({res['ticks']} tics / {args.ticks} cap)")
     print(f" Level Exit Reached  : {'YES (COMPLETE)' if res['exit_reached'] else 'NO (Full Survival Duration)'}")
     print(f" Health Remaining    : {res['hp_remaining']:.0f}%")

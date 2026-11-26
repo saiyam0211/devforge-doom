@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "submission"))
 
 from env.doom_env import make_env
 from submission.agent import DoomAgent
+from scripts.test_and_rate import resolve_wad_path
 
 
 HIT_TYPE_COLORS = {
@@ -210,8 +211,9 @@ def record_replay(
     output_json: Path | None = None,
 ) -> None:
     """Runs one episode, saves an animated GIF and JSON telemetry data."""
-    print(f"\n[Recording Replay] Loading {wad_name}:{map_name} (Seed: {seed}) ...")
-    env = make_env(wad_name, map_name, episode_ticks=2100)
+    wad_path = resolve_wad_path(wad_name)
+    print(f"\n[Recording Replay] Loading {Path(wad_path).name}:{map_name} (Seed: {seed}) ...")
+    env = make_env(wad_path, map_name, episode_ticks=2100)
     agent = DoomAgent(env.observation_space, env.action_space, device="cpu")
 
     obs, _ = env.reset(seed=seed) if seed is not None else env.reset()

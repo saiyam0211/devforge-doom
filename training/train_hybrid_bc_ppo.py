@@ -53,7 +53,7 @@ class DoomExpertTeacher:
         self.waypoints: List[Tuple[float, float]] = []
         self.reset()
 
-    def reset(self, wad_name: str = "", map_name: str = ""):
+    def reset(self, wad_name: str = "", map_name: str = "", jitter: bool = False):
         self.wad_name = wad_name
         self.map_name = map_name
         self.step_idx = 0
@@ -66,7 +66,7 @@ class DoomExpertTeacher:
         self.wp_idx = 0
 
         if "two_rooms" in self.wad_name:
-            self.waypoints = [
+            base_wp = [
                 (350.0, 350.0),
                 (430.0, 352.0),  # Door 1
                 (540.0, 350.0),
@@ -75,13 +75,14 @@ class DoomExpertTeacher:
                 (672.0, 96.0),   # Exit Trigger
             ]
         elif "freedoom2" in self.wad_name and self.map_name == "MAP01":
-            self.waypoints = [
+            base_wp = [
                 # 1. Start room to Hallway
                 (-32.0, -128.0),
                 (64.0, -128.0),
                 (160.0, -128.0),
                 (256.0, -128.0),
-                (288.0, -32.0),
+                (320.0, -128.0),
+                (380.0, -140.0),
                 # 2. Shotgun pickup & Door 1
                 (448.0, -160.0),   # Shotgun
                 (544.0, -160.0),
@@ -92,8 +93,9 @@ class DoomExpertTeacher:
                 (850.0, 150.0),
                 (1100.0, 200.0),
                 (1350.0, 150.0),
-                (1408.0, -64.0),
+                (1408.0, -40.0),
                 # 4. East Corridor & Stimpack
+                (1440.0, -80.0),
                 (1472.0, -80.0),
                 (1536.0, -80.0),
                 (1600.0, -80.0),
@@ -101,8 +103,8 @@ class DoomExpertTeacher:
                 (1736.0, -88.0),   # Stimpack
                 (1792.0, -160.0),
                 (1824.0, -160.0),  # Door 2 (Line 332)
-                (1950.0, -160.0),
-                # 5. Long South Corridor
+                # 5. Long South Corridor (with alcove check)
+                (1952.0, -40.0),   # Clear North alcove ShotgunGuy
                 (1950.0, -400.0),
                 (1950.0, -700.0),
                 (1930.0, -830.0),  # Top of curved staircase
@@ -110,7 +112,8 @@ class DoomExpertTeacher:
                 (1870.0, -860.0),
                 (1800.0, -860.0),
                 (1740.0, -856.0),
-                (1680.0, -856.0),  # Entering lower corridor
+                (1680.0, -856.0),
+                (1600.0, -856.0),  # Clear corner blocking wall at x=1696
                 # 7. Lower West Corridor
                 (1550.0, -950.0),
                 (1400.0, -1000.0),
@@ -119,16 +122,30 @@ class DoomExpertTeacher:
                 (672.0, -1024.0),
                 (648.0, -1024.0),  # Door 3 (Line 876)
                 (608.0, -1024.0),
-                # 8. Hallway to Exit Booth
+                # 8. Hallway to Exit Booth (smooth cornering & centered entrance)
                 (450.0, -1024.0),
-                (300.0, -1024.0),
-                (216.0, -1000.0),
-                (216.0, -800.0),
-                (216.0, -616.0),   # Exit Door (Line 839)
-                (216.0, -632.0),   # Exit Switch (Line 774)
+                (320.0, -1024.0),
+                (240.0, -980.0),
+                (216.0, -880.0),
+                (216.0, -740.0),
+                (216.0, -670.0),
+                (216.0, -636.0),   # Exit Switch (Line 774)
             ]
         else:
+            base_wp = []
+
+        if jitter and base_wp:
             self.waypoints = []
+            for i, (wx, wy) in enumerate(base_wp):
+                # Never jitter critical door thresholds or the exit switch itself
+                if ("two_rooms" in self.wad_name and i in (1, 5)) or ("freedoom2" in self.wad_name and i in (8, 22, 37, 43)):
+                    self.waypoints.append((wx, wy))
+                else:
+                    jx = float(np.clip(np.random.normal(0, 8.0), -14.0, 14.0))
+                    jy = float(np.clip(np.random.normal(0, 8.0), -14.0, 14.0))
+                    self.waypoints.append((wx + jx, wy + jy))
+        else:
+            self.waypoints = base_wp
 
     def act(self, obs: Dict[str, Any], priv: Dict[str, Any] | None = None) -> np.ndarray:
         self.step_idx += 1
@@ -155,7 +172,7 @@ class DoomExpertTeacher:
             tx, ty = self.waypoints[self.wp_idx]
 
             dist = math.hypot(tx - px, ty - py)
-            adv_threshold = 40.0 if "two_rooms" in self.wad_name else 64.0
+            adv_threshold = 16.0 if self.wp_idx >= len(self.waypoints) - 2 else (40.0 if "two_rooms" in self.wad_name else 48.0)
             if dist < adv_threshold and self.wp_idx < len(self.waypoints) - 1:
                 self.wp_idx += 1
                 tx, ty = self.waypoints[self.wp_idx]
@@ -171,45 +188,65 @@ class DoomExpertTeacher:
                 act[5] = 1
 
             # Throttle
-            if abs(angle_diff) < 60.0:
+            if abs(angle_diff) < 35.0:
                 act[0] = 1
 
-            # Dynamic Combat Engagement (Frontal Cone Focus to keep moving forward)
+            # Dynamic Combat Engagement (Prioritize close blockers, keep distance)
             enemies = [i for i in range(len(mask)) if mask[i] == 1 and types[i] in (1, 2, 3)]
             if enemies:
-                frontal_enemies = [i for i in enemies if feats[i, 2] > 0.0]
-                target_list = frontal_enemies if frontal_enemies else enemies
-                best_e = min(target_list, key=lambda i: feats[i, 0])
-                e_dist = feats[best_e, 0] * 1024.0
-                e_sin = feats[best_e, 1]
-                e_cos = feats[best_e, 2]
+                close_enemies = [i for i in enemies if feats[i, 0] * 1024.0 < 280.0 and feats[i, 2] > 0.0]
+                if close_enemies:
+                    best_e = min(close_enemies, key=lambda i: feats[i, 0])
+                    e_dist = feats[best_e, 0] * 1024.0
+                    e_sin = feats[best_e, 1]
+                    e_cos = feats[best_e, 2]
 
-                # Fast aim lock on close frontal enemies
-                if e_dist < 350.0 and e_cos > 0.0:
-                    if e_sin > 0.06:
+                    # Fast aim lock on close frontal enemies
+                    if e_sin > 0.05:
                         act[4] = 1
                         act[5] = 0
-                    elif e_sin < -0.06:
+                    elif e_sin < -0.05:
                         act[5] = 1
                         act[4] = 0
 
-                # Fire shotgun when target is centered in FOV
-                if e_dist < 500.0 and e_cos > 0.5 and abs(e_sin) < 0.35:
-                    act[6] = 1
+                    # Throttle gating: do not run into enemy face, but keep pressure
+                    if e_dist < 64.0:
+                        act[0] = 0
+                        act[1] = 1
+                    elif abs(angle_diff) < 35.0:
+                        act[0] = 1
+
+                    # Fire weapon when target is centered in FOV
+                    if e_cos > 0.5 and abs(e_sin) < 0.28:
+                        act[6] = 1
 
             # Door & Switch interaction
+            front_d = obs["rays"]["distance"][0]
+            hits = obs["rays"]["hit_type"]
             is_door_ahead = hits[0] in (2, 3) or hits[63] in (2, 3) or hits[1] in (2, 3)
 
             # Special door/switch trigger positions
-            door_trigger = False
             if "two_rooms" in self.wad_name:
-                door_trigger = (px > 405.0 and px < 442.0 and front_d < 0.08)
+                if px > 405.0 and px < 442.0 and front_d < 0.12:
+                    if self.use_cooldown == 0:
+                        act[7] = 1
+                        self.use_cooldown = 10
             elif "freedoom2" in self.wad_name:
-                door_trigger = (self.wp_idx in (7, 20, 34, 40, 41) and dist < 75.0 and front_d < 0.15)
+                # Door waypoints: Door 1 (8), Door 2 (22), Door 3 (37)
+                if self.wp_idx in (8, 22, 37) and dist < 85.0:
+                    if self.use_cooldown == 0:
+                        act[7] = 1
+                        self.use_cooldown = 10
+                # Exit switch: waypoint >= 42 (Line 774)
+                elif self.wp_idx >= 42 and dist < 85.0:
+                    if self.use_cooldown == 0:
+                        act[7] = 1
+                        self.use_cooldown = 2
+                    act[0] = 1  # drive forward into switch face
 
-            if (door_trigger or (is_door_ahead and front_d < 0.08)) and self.use_cooldown == 0:
+            if is_door_ahead and front_d < 0.20 and self.use_cooldown == 0:
                 act[7] = 1
-                self.use_cooldown = 4
+                self.use_cooldown = 12
 
             if self.use_cooldown > 0:
                 self.use_cooldown -= 1
@@ -412,8 +449,10 @@ def collect_demonstrations(
 
         while ep_completed < target_episodes and attempts < max_attempts:
             attempts += 1
-            obs, info = env.reset()
-            teacher.reset(wad_name, map_name)
+            seed = ep_completed * 3 + attempts
+            obs, info = env.reset(seed=seed)
+            apply_jitter = (ep_completed % 2 == 1)
+            teacher.reset(wad_name, map_name, jitter=apply_jitter)
 
             ray_dists, ray_hits = [], []
             ent_feats, ent_types, ent_masks = [], [], []
@@ -488,7 +527,7 @@ def train_behavioral_cloning(
 
     # Class weights for binary actions: ATTACK (pos_weight 3.0), USE (pos_weight 6.0), WEAPON (pos_weight 0.2)
     bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([3.0, 6.0, 0.2]).to(device))
-    weight_fb = torch.tensor([1.0, 1.2, 0.4]).to(device)
+    weight_fb = torch.tensor([1.2, 1.0, 1.2]).to(device)
     weight_turn = torch.tensor([0.8, 1.2, 1.2]).to(device)
 
     for epoch in range(1, epochs + 1):
@@ -597,16 +636,12 @@ def main():
     freedoom2_path = IWAD
 
     # Curricula: (WAD path, Map name, Target episodes)
-    # Guaranteed high exit ratio on both two_rooms and freedoom2 MAP01
+    # Balanced curriculum: High exit ratio on two_rooms and freedoom2 MAP01 across varied seeds
     training_curricula = [
         (two_rooms_path, "MAP01", 20),
-        (freedoom2_path, "MAP01", 30),
-        (two_rooms_path, "MAP01", 15),
-        (freedoom2_path, "MAP01", 20),
-        (freedoom2_path, "MAP02", 6),
-        (freedoom2_path, "MAP03", 6),
-        (freedoom2_path, "MAP04", 4),
-        (freedoom2_path, "MAP05", 4),
+        (freedoom2_path, "MAP01", 35),
+        (freedoom2_path, "MAP02", 8),
+        (freedoom2_path, "MAP03", 8),
     ]
 
     # 1. Collect Demonstrations

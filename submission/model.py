@@ -337,7 +337,7 @@ class SpatialEgoNet(nn.Module):
             act_lr = torch.argmax(logits_lr, dim=-1)
             act_turn = torch.argmax(logits_turn, dim=-1)
             # Calibrated thresholds for class-imbalanced binary actions:
-            act_atk = (logits_binary[:, 0] > -0.5).float()  # ATTACK (p > 0.38)
+            act_atk = (logits_binary[:, 0] > -0.8).float()  # ATTACK (p > 0.31)
             act_use = (logits_binary[:, 1] > -1.2).float()  # USE (p > 0.23)
             act_wep = (logits_binary[:, 2] > 0.0).float()   # WEAPON
             act_binary = torch.stack([act_atk, act_use, act_wep], dim=-1)

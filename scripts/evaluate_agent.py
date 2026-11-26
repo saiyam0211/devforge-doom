@@ -37,6 +37,9 @@ def resolve_wad_path(wad_spec: str) -> str:
         candidate = vizdoom_dir / wad_spec
         if candidate.is_file():
             return str(candidate.resolve())
+        candidate_scen = vizdoom_dir / "scenarios" / wad_spec
+        if candidate_scen.is_file():
+            return str(candidate_scen.resolve())
     except ImportError:
         pass
     raise FileNotFoundError(f"Cannot resolve WAD path for: {wad_spec}")
