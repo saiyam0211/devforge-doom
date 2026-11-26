@@ -86,17 +86,18 @@ def run_rulebook_test(
     episode_ticks: int = 2100,
     visible: bool = False,
     device: str = "cpu",
+    seed: int | None = 0,
 ) -> Dict[str, Any]:
     wad_path = resolve_wad_path(wad_name)
     print(f"\n=======================================================")
-    print(f" DevForge Rulebook Test: {Path(wad_path).name}:{map_name}")
+    print(f" DevForge Rulebook Test: {Path(wad_path).name}:{map_name} (Seed: {seed})")
     print(f" Episode Cap: {episode_ticks} tics (525 steps) | Window: {visible}")
     print(f"=======================================================")
 
     env = LiveDoomEnv(wad_path, map_name=map_name, visible=visible, episode_ticks=episode_ticks)
     agent = DoomAgent(env.observation_space, env.action_space, device=device)
 
-    obs, info = env.reset()
+    obs, info = env.reset(seed=seed) if seed is not None else env.reset()
     agent.reset()
 
     step_latencies: List[float] = []
@@ -217,6 +218,7 @@ def main():
     parser.add_argument("--ticks", type=int, default=2100, help="Episode ticks limit")
     parser.add_argument("--window", action="store_true", help="Open native window on desktop for live visual viewing")
     parser.add_argument("--device", type=str, default="cpu", help="PyTorch device")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for environment reset (default: 0)")
     args = parser.parse_args()
 
     res = run_rulebook_test(
@@ -225,6 +227,7 @@ def main():
         episode_ticks=args.ticks,
         visible=args.window,
         device=args.device,
+        seed=args.seed,
     )
 
     print("\n" + "=" * 70)
