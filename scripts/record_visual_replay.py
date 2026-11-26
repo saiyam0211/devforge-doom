@@ -203,17 +203,18 @@ def create_composite_frame(
 def record_replay(
     wad_name: str = "maps/two_rooms.wad",
     map_name: str = "MAP01",
-    max_steps: int = 150,
+    max_steps: int = 200,
     step_skip: int = 2,
+    seed: int | None = 0,
     output_gif: Path | None = None,
     output_json: Path | None = None,
 ) -> None:
     """Runs one episode, saves an animated GIF and JSON telemetry data."""
-    print(f"\n[Recording Replay] Loading {wad_name}:{map_name} ...")
+    print(f"\n[Recording Replay] Loading {wad_name}:{map_name} (Seed: {seed}) ...")
     env = make_env(wad_name, map_name, episode_ticks=2100)
     agent = DoomAgent(env.observation_space, env.action_space, device="cpu")
 
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=seed) if seed is not None else env.reset()
     agent.reset()
 
     frames: list[Image.Image] = []
@@ -280,4 +281,24 @@ def record_replay(
 
 
 if __name__ == "__main__":
-    record_replay()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Record Doom Visual Telemetry Replay")
+    parser.add_argument("--wad", type=str, default="maps/two_rooms.wad", help="WAD file")
+    parser.add_argument("--map", type=str, default="MAP01", help="Map name")
+    parser.add_argument("--steps", type=int, default=200, help="Max steps")
+    parser.add_argument("--skip", type=int, default=2, help="Frame step skip")
+    parser.add_argument("--seed", type=int, default=0, help="Environment seed")
+    parser.add_argument("--gif", type=str, default=None, help="Output GIF path")
+    parser.add_argument("--json", type=str, default=None, help="Output JSON path")
+    args = parser.parse_args()
+
+    record_replay(
+        wad_name=args.wad,
+        map_name=args.map,
+        max_steps=args.steps,
+        step_skip=args.skip,
+        seed=args.seed,
+        output_gif=Path(args.gif) if args.gif else None,
+        output_json=Path(args.json) if args.json else None,
+    )
