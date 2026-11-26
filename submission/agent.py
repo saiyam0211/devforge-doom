@@ -29,7 +29,7 @@ except ImportError:
 class DoomAgent:
     """Production DoomAgent executing Spatial-EgoNet neural policy."""
 
-    def __init__(self, observation_space, action_space, device: str):
+    def __init__(self, observation_space, action_space, device: str = "cpu"):
         """Called once. Load weights onto `device` ("cuda" or "cpu")."""
         self.observation_space = observation_space
         self.action_space = action_space
@@ -48,10 +48,15 @@ class DoomAgent:
             weights_path = WEIGHTS_DIR / "agent_weights.pt"
             if weights_path.is_file():
                 try:
-                    state_dict = torch.load(weights_path, map_location=self.device, weights_only=True)
+                    loaded = torch.load(weights_path, map_location=self.device, weights_only=True)
+                    if isinstance(loaded, dict) and "model_state_dict" in loaded:
+                        state_dict = loaded["model_state_dict"]
+                    else:
+                        state_dict = loaded
                     self.model.load_state_dict(state_dict)
-                except Exception:
-                    pass  # Fall back to initialized parameters if weights file is damaged
+                    print(f"[DoomAgent] Successfully loaded trained Spatial-EgoNet weights from {weights_path.name}")
+                except Exception as e:
+                    print(f"[DoomAgent] Warning: Failed loading weights ({e}), using default initialization")
 
             self.model.eval()
             self.hidden = self.model.initial_hidden_state(batch_size=1, device=self.device)
@@ -96,13 +101,13 @@ class DoomAgent:
 
             action = action_tensor[0].cpu().numpy().astype(np.int8)
 
-            # Prevent DOOM USE spamming: pulse USE and enforce a 12-tick cooldown
+            # Prevent DOOM USE spamming: pulse USE and enforce a 3-step (12-tic) cooldown
             if action[7] == 1:
                 if self.use_cooldown > 0:
                     action[7] = 0
                     self.use_cooldown -= 1
                 else:
-                    self.use_cooldown = 12
+                    self.use_cooldown = 3
             elif self.use_cooldown > 0:
                 self.use_cooldown -= 1
 

@@ -35,42 +35,110 @@ class CircularConv1d(nn.Module):
 
 
 class RaycastEncoder(nn.Module):
-    """Processes 64 360-degree ego-centric ray distances and discrete hit types."""
+    """Processes 64 360-degree ego-centric ray distances and discrete hit types with directional sector encoding."""
 
     def __init__(self, num_hit_types: int = 6, emb_dim: int = 16, out_dim: int = 128):
         super().__init__()
         self.hit_type_emb = nn.Embedding(num_hit_types, emb_dim)
-        in_channels = 1 + emb_dim  # distance (1) + hit_type_embedding
 
-        self.net = nn.Sequential(
-            CircularConv1d(in_channels, 32, kernel_size=5),
-            nn.GroupNorm(4, 32),
-            nn.GELU(),
-            CircularConv1d(32, 64, kernel_size=5),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            CircularConv1d(64, 64, kernel_size=3),
-            nn.GELU(),
-        )
-        # Pool across 64 rays (max + avg) -> 64 * 2 = 128
-        self.proj = nn.Linear(128, out_dim)
+        # 64 ray angles in ego frame: 0 is fwd (+x), 16 is left (+y), 32 is back (-x), 48 is right (-y)
+        angles = torch.linspace(0, 2 * math.pi, 65)[:-1]
+        self.register_buffer("cos_a", torch.cos(angles))  # [64]
+        self.register_buffer("sin_a", torch.sin(angles))  # [64]
+
+        # Ray channels: dist(1) + dir(2) + cartesian_hit(2) + hit_emb(16) = 21
+        in_channels = 1 + 2 + 2 + emb_dim
+
+        self.pad2 = 2
+        self.conv1 = nn.Conv1d(in_channels, 32, kernel_size=5)
+        self.norm1 = nn.GroupNorm(4, 32)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=5)
+        self.norm2 = nn.GroupNorm(8, 64)
+        self.conv3 = nn.Conv1d(64, 64, kernel_size=3)
+        self.pad1 = 1
+
+        # 8-Sector Spatial Pooling: pools features across 8 cardinal & intercardinal directions:
+        # Sector 0: Front (-22.5 to +22.5 deg)
+        # Sector 1: Front-Left (+22.5 to +67.5 deg)
+        # Sector 2: Left (+67.5 to +112.5 deg)
+        # Sector 3: Back-Left (+112.5 to +157.5 deg)
+        # Sector 4: Back (+157.5 to +202.5 deg)
+        # Sector 5: Back-Right (+202.5 to +247.5 deg)
+        # Sector 6: Right (+247.5 to +292.5 deg)
+        # Sector 7: Front-Right (+292.5 to +337.5 deg)
+        self.sector_proj = nn.Conv1d(128, 16, kernel_size=1)  # 128 (max+avg of 64 ch) -> 16 per sector
+        # 8 sectors * 16 = 128 features
+
+        # Explicit geometric sector stats: 8 sectors * 6 stats (min_d, max_d, mean_d, is_door, is_enemy, is_item) = 48
+        self.geo_proj = nn.Linear(48, 32)
+
+        # Global pooling summary: max(64) + avg(64) = 128 -> 32
+        self.global_proj = nn.Linear(128, 32)
+
+        # Final ray representation
+        self.out_proj = nn.Linear(128 + 32 + 32, out_dim)
 
     def forward(self, distance: torch.Tensor, hit_type: torch.Tensor) -> torch.Tensor:
         # distance: [B, 64], hit_type: [B, 64]
         b, n = distance.shape
-        dist_feat = distance.unsqueeze(1)  # [B, 1, 64]
-        type_feat = self.hit_type_emb(hit_type).transpose(1, 2)  # [B, emb_dim, 64]
-        x = torch.cat([dist_feat, type_feat], dim=1)  # [B, 1 + emb_dim, 64]
 
-        feat_map = self.net(x)  # [B, 64, 64]
-        max_pool = torch.max(feat_map, dim=-1)[0]  # [B, 64]
-        avg_pool = torch.mean(feat_map, dim=-1)  # [B, 64]
-        pooled = torch.cat([max_pool, avg_pool], dim=-1)  # [B, 128]
-        return self.proj(pooled)  # [B, out_dim]
+        # Cartesian hit points in ego coordinates: x is forward, y is left
+        hit_x = (distance * self.cos_a).unsqueeze(1)  # [B, 1, 64]
+        hit_y = (distance * self.sin_a).unsqueeze(1)  # [B, 1, 64]
+        dir_x = self.cos_a.view(1, 1, 64).expand(b, -1, -1)
+        dir_y = self.sin_a.view(1, 1, 64).expand(b, -1, -1)
+        dist_in = distance.unsqueeze(1)  # [B, 1, 64]
+        type_emb = self.hit_type_emb(hit_type).transpose(1, 2)  # [B, 16, 64]
+
+        x = torch.cat([dist_in, dir_x, dir_y, hit_x, hit_y, type_emb], dim=1)  # [B, 21, 64]
+
+        # Circular Conv 1
+        x = torch.cat([x[..., -self.pad2 :], x, x[..., : self.pad2]], dim=-1)
+        x = F.gelu(self.norm1(self.conv1(x)))
+
+        # Circular Conv 2
+        x = torch.cat([x[..., -self.pad2 :], x, x[..., : self.pad2]], dim=-1)
+        x = F.gelu(self.norm2(self.conv2(x)))
+
+        # Circular Conv 3
+        x = torch.cat([x[..., -self.pad1 :], x, x[..., : self.pad1]], dim=-1)
+        feat_map = F.gelu(self.conv3(x))  # [B, 64, 64]
+
+        # 8-Sector Spatial Pooling
+        # Roll by 4 so sector 0 covers rays [-4..+3] (indices 60..63 and 0..3: straight ahead)
+        feat_rolled = torch.roll(feat_map, shifts=4, dims=-1)
+        sectors = feat_rolled.view(b, 64, 8, 8)  # [B, 64, 8 sectors, 8 rays/sec]
+        sec_max = torch.max(sectors, dim=-1)[0]  # [B, 64, 8]
+        sec_avg = torch.mean(sectors, dim=-1)  # [B, 64, 8]
+        sec_cat = torch.cat([sec_max, sec_avg], dim=1)  # [B, 128, 8]
+        sec_out = self.sector_proj(sec_cat).view(b, -1)  # [B, 128]
+
+        # Explicit Geometric Sector Stats: min distance, max clearance, mean distance, door, enemy, item
+        dist_rolled = torch.roll(distance, shifts=4, dims=-1).view(b, 8, 8)
+        hit_rolled = torch.roll(hit_type, shifts=4, dims=-1).view(b, 8, 8)
+
+        sec_min_d = torch.min(dist_rolled, dim=-1)[0]  # [B, 8]
+        sec_max_d = torch.max(dist_rolled, dim=-1)[0]  # [B, 8]
+        sec_mean_d = torch.mean(dist_rolled, dim=-1)  # [B, 8]
+        sec_door = ((hit_rolled == 2) | (hit_rolled == 3)).float().max(dim=-1)[0]  # [B, 8]
+        sec_enemy = (hit_rolled == 4).float().max(dim=-1)[0]  # [B, 8]
+        sec_item = (hit_rolled == 5).float().max(dim=-1)[0]  # [B, 8]
+
+        geo_feats = torch.cat([sec_min_d, sec_max_d, sec_mean_d, sec_door, sec_enemy, sec_item], dim=-1)  # [B, 48]
+        geo_out = F.gelu(self.geo_proj(geo_feats))  # [B, 32]
+
+        # Global Pooling Summary
+        glob_max = torch.max(feat_map, dim=-1)[0]  # [B, 64]
+        glob_avg = torch.mean(feat_map, dim=-1)  # [B, 64]
+        glob_out = F.gelu(self.global_proj(torch.cat([glob_max, glob_avg], dim=-1)))  # [B, 32]
+
+        # Fuse all ego-spatial components
+        combined = torch.cat([sec_out, geo_out, glob_out], dim=-1)  # [B, 192]
+        return self.out_proj(combined)
 
 
 class EntityAttentionEncoder(nn.Module):
-    """Permutation-invariant self-attention over up to 32 visible entities in FOV."""
+    """Permutation-invariant self-attention over up to 32 visible entities with nearest-target ego tracking."""
 
     def __init__(self, num_entity_types: int = 12, type_dim: int = 16, feat_dim: int = 5, out_dim: int = 64):
         super().__init__()
@@ -81,7 +149,8 @@ class EntityAttentionEncoder(nn.Module):
         # Multi-Head Attention
         self.mha = nn.MultiheadAttention(embed_dim=out_dim, num_heads=4, batch_first=True)
         self.norm = nn.LayerNorm(out_dim)
-        self.out_proj = nn.Linear(out_dim * 2, out_dim)
+        # Pooled attention (out_dim * 2) + 4 target ego telemetry (4 * 5 = 20) -> out_dim
+        self.out_proj = nn.Linear(out_dim * 2 + 20, out_dim)
 
     def forward(self, features: torch.Tensor, entity_type: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # features: [B, 32, 5], entity_type: [B, 32], mask: [B, 32]
@@ -91,7 +160,7 @@ class EntityAttentionEncoder(nn.Module):
         x = F.gelu(self.entity_proj(x))  # [B, 32, out_dim]
 
         # Key padding mask: True indicates value SHOULD be ignored in PyTorch MHA
-        key_padding_mask = (mask == 0)  # [B, 32]
+        key_padding_mask = mask == 0  # [B, 32]
 
         # If an entire batch row has mask == 0, avoid NaN in attention softmax
         all_masked = key_padding_mask.all(dim=-1)
@@ -112,7 +181,38 @@ class EntityAttentionEncoder(nn.Module):
         max_pool = torch.max(neg_inf_x, dim=1)[0]
         max_pool = torch.where(all_masked.unsqueeze(-1), torch.zeros_like(max_pool), max_pool)
 
-        pooled = torch.cat([mean_pool, max_pool], dim=-1)  # [B, out_dim * 2]
+        # Explicit Ego-Target Telemetry Extraction:
+        # 1. Nearest Enemy (types 1, 2, 3)
+        is_enemy = (mask.bool()) & ((entity_type == 1) | (entity_type == 2) | (entity_type == 3))
+        d_enemy = torch.where(is_enemy, features[:, :, 0], torch.tensor(1e6, device=features.device))
+        idx_enemy = torch.argmin(d_enemy, dim=1)
+        has_enemy = is_enemy.any(dim=1).unsqueeze(-1).float()
+        near_enemy = torch.gather(features, 1, idx_enemy.view(b, 1, 1).expand(-1, -1, 5)).squeeze(1) * has_enemy
+
+        # 2. Nearest Keycard (type 9)
+        is_key = (mask.bool()) & (entity_type == 9)
+        d_key = torch.where(is_key, features[:, :, 0], torch.tensor(1e6, device=features.device))
+        idx_key = torch.argmin(d_key, dim=1)
+        has_key = is_key.any(dim=1).unsqueeze(-1).float()
+        near_key = torch.gather(features, 1, idx_key.view(b, 1, 1).expand(-1, -1, 5)).squeeze(1) * has_key
+
+        # 3. Nearest Item Pickup (types 5, 6, 7, 8)
+        is_item = (mask.bool()) & ((entity_type >= 5) & (entity_type <= 8))
+        d_item = torch.where(is_item, features[:, :, 0], torch.tensor(1e6, device=features.device))
+        idx_item = torch.argmin(d_item, dim=1)
+        has_item = is_item.any(dim=1).unsqueeze(-1).float()
+        near_item = torch.gather(features, 1, idx_item.view(b, 1, 1).expand(-1, -1, 5)).squeeze(1) * has_item
+
+        # 4. Nearest Projectile (type 4: incoming projectile to dodge)
+        is_proj = (mask.bool()) & (entity_type == 4)
+        d_proj = torch.where(is_proj, features[:, :, 0], torch.tensor(1e6, device=features.device))
+        idx_proj = torch.argmin(d_proj, dim=1)
+        has_proj = is_proj.any(dim=1).unsqueeze(-1).float()
+        near_proj = torch.gather(features, 1, idx_proj.view(b, 1, 1).expand(-1, -1, 5)).squeeze(1) * has_proj
+
+        target_telemetry = torch.cat([near_enemy, near_key, near_item, near_proj], dim=-1)  # [B, 20]
+
+        pooled = torch.cat([mean_pool, max_pool, target_telemetry], dim=-1)  # [B, out_dim * 2 + 20]
         return self.out_proj(pooled)  # [B, out_dim]
 
 
@@ -236,7 +336,11 @@ class SpatialEgoNet(nn.Module):
             act_fb = torch.argmax(logits_fb, dim=-1)
             act_lr = torch.argmax(logits_lr, dim=-1)
             act_turn = torch.argmax(logits_turn, dim=-1)
-            act_binary = (logits_binary > 0).float()
+            # Calibrated thresholds for class-imbalanced binary actions:
+            act_atk = (logits_binary[:, 0] > -0.5).float()  # ATTACK (p > 0.38)
+            act_use = (logits_binary[:, 1] > -0.8).float()  # USE (p > 0.31)
+            act_wep = (logits_binary[:, 2] > 0.0).float()   # WEAPON
+            act_binary = torch.stack([act_atk, act_use, act_wep], dim=-1)
         else:
             act_fb = dist_fb.sample()
             act_lr = dist_lr.sample()
@@ -268,6 +372,11 @@ class SpatialEgoNet(nn.Module):
         actions[:, 6] = act_binary[:, 0].to(torch.int8)  # ATTACK
         actions[:, 7] = act_binary[:, 1].to(torch.int8)  # USE
         actions[:, 8] = act_binary[:, 2].to(torch.int8)  # WEAPON
+
+        # Guard: only allow weapon switch if current weapon is empty (ammo == 0)
+        current_ammo = obs["vitals"][:, 3]
+        has_ammo = (current_ammo > 0).to(torch.int8)
+        actions[:, 8] = actions[:, 8] * (1 - has_ammo)
 
         return actions, log_prob, value, next_hidden
 

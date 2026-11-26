@@ -170,12 +170,25 @@ class PPOTrainer:
 
     def save_checkpoint(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.model.state_dict(), path)
+        torch.save(
+            {
+                "model_state_dict": self.model.state_dict(),
+                "hidden_dim": 256,
+                "num_gru_layers": 2,
+                "timestamp": time.time(),
+                "arch": "Spatial-EgoNet-EgoCentric-Spatial-Encoding",
+            },
+            path,
+        )
         print(f"[Trainer] Checkpoint saved to: {path}")
 
     def load_checkpoint(self, path: Path) -> None:
         if path.is_file():
-            state_dict = torch.load(path, map_location=self.device, weights_only=True)
+            loaded = torch.load(path, map_location=self.device, weights_only=True)
+            if isinstance(loaded, dict) and "model_state_dict" in loaded:
+                state_dict = loaded["model_state_dict"]
+            else:
+                state_dict = loaded
             self.model.load_state_dict(state_dict)
             print(f"[Trainer] Checkpoint loaded from: {path}")
 
