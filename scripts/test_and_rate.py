@@ -1,12 +1,5 @@
 #!/usr/bin/env python
-"""Official DevForge Track 1 Evaluation & Scorecard Benchmark.
-
-Tests the trained DoomAgent policy strictly as per the competition rulebook:
-- Tracks Exit, Progression (keys & doors), Exploration (unique sectors), Combat (kills & damage), Survival ticks.
-- Verifies strict sub-40ms latency SLA, 1-CPU thread cap, and pure neural integrity.
-- Produces a comprehensive multi-category scorecard and competitive rating.
-- Supports `--window` for live on-screen desktop rendering.
-"""
+"""Run a seeded local ViZDoom episode and report outcome and timing."""
 
 from __future__ import annotations
 
@@ -15,7 +8,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 # Add system site-packages for PIL if not in local venv
 sys.path.append("/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages")
@@ -27,8 +20,9 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "submission"))
 
 import vizdoom as vd
-from env.doom_env import make_env
+from env.doom_env import limits
 import env.doom_env.spaces as S
+from env.doom_env.sensors import PLAYER_HEIGHT
 from env.doom_env.wrapper import DoomEnv, GAME_VARIABLES, IWAD, SKILL
 from submission.agent import DoomAgent
 
@@ -78,14 +72,17 @@ class LiveDoomEnv(DoomEnv):
             g.set_mode(vd.Mode.PLAYER)
             g.set_window_visible(visible)
             g.set_sound_enabled(False)
-            if visible:
-                g.set_screen_resolution(vd.ScreenResolution.RES_640X480)
-            else:
-                g.set_screen_resolution(vd.ScreenResolution.RES_160X120)
+            # Match the official observation buffers in windowed and headless tests.
+            g.set_console_enabled(False)
+            g.set_screen_resolution(vd.ScreenResolution.RES_160X120)
             g.set_screen_format(vd.ScreenFormat.RGB24)
             g.set_depth_buffer_enabled(True)
-            g.set_render_hud(visible)
+            g.set_render_hud(False)
+            g.set_render_crosshair(False)
             g.set_render_weapon(True)
+            g.set_render_decals(False)
+            g.set_render_particles(False)
+            g.set_render_messages(False)
             g.set_render_corpses(True)
             g.set_objects_info_enabled(True)
             g.set_sectors_info_enabled(True)
@@ -104,50 +101,49 @@ def run_rulebook_test(
     device: str = "cpu",
     seed: int | None = 0,
     skill: int = 3,
+    checkpoint: Path | None = None,
 ) -> Dict[str, Any]:
     wad_path = resolve_wad_path(wad_name)
     skill_str = SKILL_NAMES.get(skill, f"Skill {skill}")
     print(f"\n=======================================================")
-    print(f" DevForge Rulebook Test: {Path(wad_path).name}:{map_name} (Seed: {seed})")
+    print(f" DevForge Local Test: {Path(wad_path).name}:{map_name} (Seed: {seed})")
     print(f" Difficulty: {skill_str}")
-    print(f" Episode Cap: {episode_ticks} tics ({episode_ticks // S.FRAME_SKIP} steps) | Window: {visible}")
+    print(f" Episode Cap: {episode_ticks} tics ({math.ceil(episode_ticks / S.FRAME_SKIP)} steps) | Window: {visible}")
     print(f"=======================================================")
 
     env = LiveDoomEnv(wad_path, map_name=map_name, visible=visible, episode_ticks=episode_ticks, skill=skill)
-    agent = DoomAgent(env.observation_space, env.action_space, device=device)
+    if checkpoint is None:
+        agent = DoomAgent(env.observation_space, env.action_space, device=device)
+    else:
+        from submission.neural_agent import DoomAgent as NeuralAgent
+
+        agent = NeuralAgent(env.observation_space, env.action_space, device=device, checkpoint=checkpoint)
 
     obs, info = env.reset(seed=seed) if seed is not None else env.reset()
     agent.reset()
 
-    step_latencies: List[float] = []
-    actions_taken: List[np.ndarray] = []
-    visited_sectors = set()
-    initial_vitals = np.copy(obs["vitals"])
-    initial_hp = float(initial_vitals[0])
-
-    step_count = 0
-    total_agent_time = 0.0
-    ep_start = time.time()
+    start_tic = info["tic"]
+    initial_keys = int(obs["vitals"][8:14].sum())
+    step_latencies: list[float] = []
+    visited_cells = set()
+    opened_doors = set()
+    start_state = env.privileged_state()
+    doors = start_state["door_lock"] >= 0
+    initially_passable = start_state["sector_ceiling"] - start_state["sector_floor"] >= PLAYER_HEIGHT
+    ep_start = time.perf_counter()
     total_reward = 0.0
 
+    state = start_state
     while True:
+        visited_cells.add((math.floor(state["x"] / 128), math.floor(state["y"] / 128)))
         t0 = time.perf_counter()
         action = agent.act(obs)
-        dt = time.perf_counter() - t0
-        dt_ms = dt * 1000.0
-        step_latencies.append(dt_ms)
-        total_agent_time += dt
-        actions_taken.append(action)
-
-        # Track sectors explored
-        state = env._game.get_state()
-        if state and state.sectors:
-            for sec in state.sectors:
-                visited_sectors.add((round(sec.floor_height), round(sec.ceiling_height)))
-
+        step_latencies.append(time.perf_counter() - t0)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
-        step_count += 1
+        state = env.privileged_state()
+        passable = state["sector_ceiling"] - state["sector_floor"] >= PLAYER_HEIGHT
+        opened_doors.update(np.flatnonzero(doors & ~initially_passable & passable))
 
         if visible:
             # Throttle slightly to simulate real-time ~35 FPS playback in window
@@ -156,95 +152,81 @@ def run_rulebook_test(
         if terminated or truncated:
             break
 
-    total_wall_time = time.time() - ep_start
+    total_wall_time = time.perf_counter() - ep_start
+    final = state
     env.close()
 
-    final_vitals = obs["vitals"]
-    final_hp = float(final_vitals[0])
-    exit_reached = bool(info.get("exit_reached", False) or info.get("success", False))
-    keys_initial = int(np.sum(initial_vitals[8:14]))
-    keys_final = int(np.sum(final_vitals[8:14]))
-    keys_collected = max(0, keys_final - keys_initial)
+    visited_cells.add((math.floor(final["x"] / 128), math.floor(final["y"] / 128)))
+    steps = len(step_latencies)
+    # ViZDoom resets its episode timer when leaving some maps.
+    elapsed_tics = final["tic"] - start_tic
+    estimated_tics = elapsed_tics <= 0
+    if estimated_tics:
+        elapsed_tics = min(steps * S.FRAME_SKIP, episode_ticks)
 
-    # Latency percentiles
-    lat_arr = np.array(step_latencies)
-    p50_lat = float(np.percentile(lat_arr, 50))
-    p95_lat = float(np.percentile(lat_arr, 95))
-    p99_lat = float(np.percentile(lat_arr, 99))
-    max_lat = float(np.max(lat_arr))
-
-    # Compute official rulebook scores
-    # 1. Exit & Survival: Max 35 points
-    surv_ratio = min(1.0, (step_count * 4) / episode_ticks)
-    exit_score = 35.0 if exit_reached else (15.0 * surv_ratio)
-
-    # 2. Progression: Keys & Doors: Max 25 points
-    if exit_reached:
-        # Reaching level exit confirms all required doors, corridors, and locks were traversed
-        prog_score = 25.0
-    else:
-        use_count = sum(1 for a in actions_taken if a[7] == 1)
-        door_score = min(15.0, use_count * 0.5)
-        prog_score = (keys_collected * 10.0) + door_score
-        prog_score = min(25.0, prog_score)
-
-    # 3. Exploration: Max 20 points
-    num_sectors = len(visited_sectors)
-    # Reaching the level exit guarantees full critical-path traversal from start to finish
-    expl_score = 20.0 if exit_reached else min(20.0, num_sectors * 0.8)
-
-    # 4. Latency & SLA Budget: Max 20 points
-    sla_score = 20.0 if (p99_lat < 40.0 and total_agent_time < 21.0) else 0.0
-
-    total_score = exit_score + prog_score + expl_score + sla_score
-
-    # Letter Grade
-    if total_score >= 85:
-        grade = "A+ (S-Tier Contender)"
-    elif total_score >= 70:
-        grade = "A  (Strong Contender)"
-    elif total_score >= 55:
-        grade = "B+ (Above Average)"
-    elif total_score >= 40:
-        grade = "B  (Passing)"
-    else:
-        grade = "C  (Needs Tuning)"
+    outcome = "Exit reached" if final["exit_reached"] else "Died" if final["dead"] else "Tick cap"
+    lat_ms = np.array(step_latencies) * 1000
+    agent_time = sum(step_latencies)
+    budget = limits.agent_budget_s(episode_ticks)
 
     return {
         "wad": Path(wad_path).name,
         "map": map_name,
-        "steps": step_count,
-        "ticks": step_count * 4,
+        "steps": steps,
+        "ticks": elapsed_tics,
+        "estimated_ticks": estimated_tics,
         "wall_time": total_wall_time,
-        "agent_time": total_agent_time,
-        "exit_reached": exit_reached,
-        "keys_collected": keys_collected,
-        "sectors_explored": num_sectors,
-        "hp_remaining": final_hp,
+        "agent_time": agent_time,
+        "agent_budget": budget,
+        "timing_pass": (
+            step_latencies[0] <= limits.FIRST_ACT_TIMEOUT_S
+            and max(step_latencies[1:], default=0.0) <= limits.ACT_TIMEOUT_S
+            and agent_time <= budget
+        ),
+        "exit_reached": bool(final["exit_reached"]),
+        "outcome": outcome,
+        "keys_collected": max(0, int(final["keys"].sum()) - initial_keys),
+        "doors_opened": len(opened_doors),
+        "locked_doors_opened": sum(start_state["door_lock"][door] > 0 for door in opened_doors),
+        "visited_cells": len(visited_cells),
+        "hp_remaining": max(0, int(final["health"])),
+        "kills": final["kills"],
+        "damage_taken": final["damage_taken"],
         "env_reward": total_reward,
-        "p50_latency_ms": p50_lat,
-        "p95_latency_ms": p95_lat,
-        "p99_latency_ms": p99_lat,
-        "max_latency_ms": max_lat,
-        "exit_score": exit_score,
-        "prog_score": prog_score,
-        "expl_score": expl_score,
-        "sla_score": sla_score,
-        "total_score": total_score,
-        "grade": grade,
+        "p50_latency_ms": float(np.percentile(lat_ms, 50)),
+        "p95_latency_ms": float(np.percentile(lat_ms, 95)),
+        "p99_latency_ms": float(np.percentile(lat_ms, 99)),
+        "max_latency_ms": float(np.max(lat_ms)),
     }
 
 
+def local_scorecard(result, episode_ticks):
+    """Keep the previous 100-point layout using measured local outcomes."""
+    points = (
+        35.0 if result["exit_reached"] else 15.0 * min(1.0, result["ticks"] / episode_ticks),
+        min(25.0, 10.0 * result["keys_collected"] + 5.0 * result["doors_opened"]),
+        min(20.0, result["visited_cells"] * 0.8),
+        20.0 if result["timing_pass"] else 0.0,
+    )
+    total = sum(points)
+    grade = next(grade for threshold, grade in ((85, "A+"), (70, "A"), (55, "B+"), (40, "B"), (0, "C"))
+                 if total >= threshold)
+    return points, total, grade
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Official Rulebook Benchmark & Rating")
+    parser = argparse.ArgumentParser(description="Run a local ViZDoom benchmark")
     parser.add_argument("--wad", type=str, default="freedoom2.wad", help="WAD file")
     parser.add_argument("--map", type=str, default="MAP01", help="Map name")
     parser.add_argument("--ticks", type=int, default=2100, help="Episode ticks limit")
     parser.add_argument("--window", action="store_true", help="Open native window on desktop for live visual viewing")
     parser.add_argument("--device", type=str, default="cpu", help="PyTorch device")
+    parser.add_argument("--checkpoint", type=Path, help="Run the specified checkpoint's neural policy")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for environment reset (default: 0)")
     parser.add_argument("--skill", type=int, default=3, choices=[1, 2, 3, 4, 5], help="Doom skill: 1 (easy) to 5 (nightmare), default 3, 4 is Ultra-Violence (Hard)")
     args = parser.parse_args()
+    if args.ticks < 1:
+        parser.error("--ticks must be positive")
 
     res = run_rulebook_test(
         wad_name=args.wad,
@@ -254,31 +236,37 @@ def main():
         device=args.device,
         seed=args.seed,
         skill=args.skill,
+        checkpoint=args.checkpoint,
     )
 
     print("\n" + "=" * 70)
-    print(" DEVFORGE TRACK 1: OFFICIAL SCORECARD & RATING")
+    print(" DEVFORGE TRACK 1: LOCAL BENCHMARK")
     print("=" * 70)
-    print(f" Environment         : {res['wad']}:{res['map']} (Skill {args.skill}: {SKILL_NAMES.get(args.skill, '')})")
-    print(f" Steps Survived      : {res['steps']} steps ({res['ticks']} tics / {args.ticks} cap)")
-    print(f" Level Exit Reached  : {'YES (COMPLETE)' if res['exit_reached'] else 'NO (Full Survival Duration)'}")
-    print(f" Health Remaining    : {res['hp_remaining']:.0f}%")
+    print(f" Environment         : {res['wad']}:{res['map']} (Skill {args.skill}: {SKILL_NAMES[args.skill]})")
+    tics = f"{'~' if res['estimated_ticks'] else ''}{res['ticks']}"
+    print(f" Episode Length      : {res['steps']} steps ({tics} tics / {args.ticks} cap)")
+    print(f" Outcome             : {res['outcome']}")
+    print(f" Health Remaining    : {res['hp_remaining']} HP")
     print(f" Keys Picked Up      : {res['keys_collected']}")
-    print(f" Sectors Explored    : {res['sectors_explored']} distinct spatial sectors")
+    print(f" Doors Opened        : {res['doors_opened']}")
+    print(f" Locked Doors Opened : {res['locked_doors_opened']}")
+    print(f" Enemies Killed      : {res['kills']}")
+    print(f" Damage Taken        : {res['damage_taken']:.0f} HP")
+    print(f" Areas Visited       : {res['visited_cells']} distinct 128-unit grid cells")
     print("-" * 70)
-    print(" HARDWARE & SLA ENFORCEMENT")
-    print(f" Decision Latency p50: {res['p50_latency_ms']:.2f} ms  (Limit: <= 40.0 ms) -> PASSED")
-    print(f" Decision Latency p99: {res['p99_latency_ms']:.2f} ms  (Limit: <= 40.0 ms) -> PASSED")
-    print(f" Agent Compute Time  : {res['agent_time']:.2f} s   (Budget: <= 21.0 s)  -> PASSED")
+    print(f" Decision Latency    : p50 {res['p50_latency_ms']:.2f} ms, p99 {res['p99_latency_ms']:.2f} ms")
+    print(f" Agent Compute Time  : {res['agent_time']:.2f} s / {res['agent_budget']:.2f} s budget")
+    print(f" Local Timing Check  : {'PASSED' if res['timing_pass'] else 'FAILED'}")
+    points, total, grade = local_scorecard(res, args.ticks)
     print("-" * 70)
-    print(" SCORE BREAKDOWN (Out of 100)")
-    print(f" 1. Exit & Survival  : {res['exit_score']:5.1f} / 35.0 pts")
-    print(f" 2. Progression/Keys : {res['prog_score']:5.1f} / 25.0 pts")
-    print(f" 3. Map Exploration  : {res['expl_score']:5.1f} / 20.0 pts")
-    print(f" 4. SLA & Rules Pass : {res['sla_score']:5.1f} / 20.0 pts")
-    print(f" ----------------------------------------------------")
-    print(f" TOTAL SCORE         : {res['total_score']:5.1f} / 100.0 pts")
-    print(f" FINAL RATING        : {res['grade']}")
+    print(" LOCAL SCORECARD (OUT OF 100)")
+    for label, value, maximum in zip(
+        ("Exit & Survival", "Progression", "Exploration", "Timing"),
+        points, (35, 25, 20, 20), strict=True,
+    ):
+        print(f" {label:<19}: {value:5.1f} / {maximum:.1f} pts")
+    print(f" {'Total Score':<19}: {total:5.1f} / 100.0 pts")
+    print(f" {'Local Rating':<19}: {grade}")
     print("=" * 70 + "\n")
 
 

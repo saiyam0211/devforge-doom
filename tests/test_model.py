@@ -106,6 +106,7 @@ def test_spatial_egonet_forward_and_eval():
         "vitals": torch.randn(b, 17),
     }
 
+    obs["vitals"][:, 3] = torch.tensor([20.0, 0.0])
     hidden = model.initial_hidden_state(batch_size=b)
     actions, log_prob, value, next_hidden = model(obs, hidden, deterministic=False)
 
@@ -119,8 +120,45 @@ def test_spatial_egonet_forward_and_eval():
     # Test evaluate_actions
     eval_log_prob, eval_val, eval_ent = model.evaluate_actions(obs, hidden, actions)
     assert eval_log_prob.shape == (b,)
+    torch.testing.assert_close(log_prob, eval_log_prob)
     assert eval_val.shape == (b,)
     assert eval_ent.shape == (b,)
+
+
+def test_visual_checkpoint_preserves_warm_start_and_accepts_window_rgb(tmp_path):
+    from submission.neural_agent import DoomAgent as NeuralAgent
+
+    base = SpatialEgoNet().eval()
+    model = SpatialEgoNet(use_rgb=True).eval()
+    model.load_state_dict(base.state_dict(), strict=False)
+    path = tmp_path / "visual.pt"
+    torch.save({"model_state_dict": model.state_dict(), "use_rgb": True}, path)
+    obs = {
+        "rays": {"distance": np.ones(64, np.float32), "hit_type": np.zeros(64, np.int64)},
+        "visible_entities": {
+            "features": np.zeros((32, 5), np.float32),
+            "entity_type": np.zeros(32, np.int64),
+            "mask": np.zeros(32, np.int8),
+        },
+        "vitals": np.zeros(17, np.float32),
+        "rgb": np.full((120, 160, 3), 255, np.uint8),
+    }
+    agent = NeuralAgent(None, None, checkpoint=path)
+    small = agent.act(obs)
+    agent.reset()
+    wide = agent.act({**obs, "rgb": np.full((480, 640, 3), 255, np.uint8)})
+    np.testing.assert_array_equal(small, wide)
+    with torch.inference_mode():
+        from training.train_progression import observe
+
+        expected = base(observe(obs), base.initial_hidden_state(), deterministic=True)[0]
+    np.testing.assert_array_equal(small, expected[0].numpy())
+
+    torch.save({"model_state_dict": model.state_dict(), "use_rgb": True, "sample_actions": True}, path)
+    sampled = NeuralAgent(None, None, checkpoint=path)
+    sequence = np.stack([sampled.act(obs) for _ in range(12)])
+    sampled.reset()
+    np.testing.assert_array_equal(sequence, np.stack([sampled.act(obs) for _ in range(12)]))
 
 
 def test_doom_agent_interface():
@@ -133,6 +171,7 @@ def test_doom_agent_interface():
 
     # Generate synthetic observation matching spaces.py
     obs = {
+        "rgb": np.zeros((120, 160, 3), dtype=np.uint8),
         "vitals": np.zeros(17, dtype=np.float32),
         "rays": {
             "distance": np.random.uniform(0.0, 1.0, size=(64,)).astype(np.float32),
@@ -164,6 +203,7 @@ def test_agent_latency_budget():
     agent.reset()
 
     obs = {
+        "rgb": np.zeros((120, 160, 3), dtype=np.uint8),
         "vitals": np.zeros(17, dtype=np.float32),
         "rays": {
             "distance": np.random.uniform(0.0, 1.0, size=(64,)).astype(np.float32),

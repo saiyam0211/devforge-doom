@@ -222,3 +222,6 @@ _vizdoom.ini
 
 # Local validator / scorer artifacts
 *.lmp
+
+# Keep the template Dockerfile available locally. The track uses the official image.
+/Dockerfile

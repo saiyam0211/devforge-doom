@@ -243,10 +243,11 @@ class VitalsEncoder(nn.Module):
 class SpatialEgoNet(nn.Module):
     """Multi-modal ego-centric architecture with recurrent spatial memory and factored policy."""
 
-    def __init__(self, hidden_dim: int = 256, num_gru_layers: int = 2):
+    def __init__(self, hidden_dim: int = 256, num_gru_layers: int = 2, use_rgb: bool = False):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_gru_layers = num_gru_layers
+        self.use_rgb = use_rgb
 
         # Modality Encoders
         self.ray_encoder = RaycastEncoder(num_hit_types=6, emb_dim=16, out_dim=128)
@@ -260,6 +261,15 @@ class SpatialEgoNet(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
         )
+        if use_rgb:
+            self.rgb_encoder = nn.Sequential(
+                nn.Conv2d(3, 12, 5, stride=2, padding=2), nn.GELU(),
+                nn.Conv2d(12, 24, 3, stride=2, padding=1), nn.GELU(),
+                nn.AdaptiveAvgPool2d((4, 5)), nn.Flatten(), nn.Linear(24 * 4 * 5, hidden_dim),
+            )
+            # Initialize as the warm-start spatial policy and learn a visual residual.
+            nn.init.zeros_(self.rgb_encoder[-1].weight)
+            nn.init.zeros_(self.rgb_encoder[-1].bias)
 
         # 2-Layer Recurrent Spatial Memory
         self.gru = nn.GRU(
@@ -304,13 +314,22 @@ class SpatialEgoNet(nn.Module):
         vitals_feats = self.vitals_encoder(vitals)
 
         fused = torch.cat([ray_feats, ent_summary, vitals_feats], dim=-1)
-        return self.fusion(fused)
+        fused = self.fusion(fused)
+        if self.use_rgb:
+            rgb = obs["rgb"]
+            height, width = rgb.shape[1:3]
+            if height % 30 == 0 and width % 40 == 0:
+                dy, dx = height // 30, width // 40
+                rgb = rgb[:, dy // 4::dy, dx // 4::dx, :]
+            fused = fused + self.rgb_encoder(rgb.permute(0, 3, 1, 2).float() / 255.0)
+        return fused
 
     def forward(
         self,
         obs: Dict[str, torch.Tensor],
         hidden: torch.Tensor,
         deterministic: bool = False,
+        generator: torch.Generator | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass emitting MultiBinary(9) actions, log_prob, value, and next hidden state."""
         features = self.extract_features(obs)  # [B, hidden_dim]
@@ -332,7 +351,15 @@ class SpatialEgoNet(nn.Module):
         dist_turn = Categorical(logits=logits_turn)
         dist_binary = Bernoulli(logits=logits_binary)
 
-        if deterministic:
+        if generator is not None:
+            act_fb, act_lr, act_turn = (
+                torch.multinomial(head.probs, 1, generator=generator).squeeze(-1)
+                for head in (dist_fb, dist_lr, dist_turn)
+            )
+            calibrated = logits_binary + logits_binary.new_tensor([0.8, 1.2, 0.0])
+            dist_binary = Bernoulli(logits=calibrated)
+            act_binary = torch.bernoulli(dist_binary.probs, generator=generator)
+        elif deterministic:
             act_fb = torch.argmax(logits_fb, dim=-1)
             act_lr = torch.argmax(logits_lr, dim=-1)
             act_turn = torch.argmax(logits_turn, dim=-1)
@@ -347,11 +374,13 @@ class SpatialEgoNet(nn.Module):
             act_turn = dist_turn.sample()
             act_binary = dist_binary.sample()
 
+        binary_valid = torch.ones_like(act_binary)
+        binary_valid[:, 2] = obs["vitals"][:, 3] <= 0
         log_prob = (
             dist_fb.log_prob(act_fb)
             + dist_lr.log_prob(act_lr)
             + dist_turn.log_prob(act_turn)
-            + dist_binary.log_prob(act_binary).sum(dim=-1)
+            + (dist_binary.log_prob(act_binary) * binary_valid).sum(dim=-1)
         )
 
         # Convert factored choices into MultiBinary(9) buttons:
@@ -418,18 +447,20 @@ class SpatialEgoNet(nn.Module):
 
         act_binary = actions_multibinary[:, 6:9].float()
 
+        binary_valid = torch.ones_like(act_binary)
+        binary_valid[:, 2] = obs["vitals"][:, 3] <= 0
         log_prob = (
             dist_fb.log_prob(act_fb)
             + dist_lr.log_prob(act_lr)
             + dist_turn.log_prob(act_turn)
-            + dist_binary.log_prob(act_binary).sum(dim=-1)
+            + (dist_binary.log_prob(act_binary) * binary_valid).sum(dim=-1)
         )
 
         entropy = (
             dist_fb.entropy()
             + dist_lr.entropy()
             + dist_turn.entropy()
-            + dist_binary.entropy().sum(dim=-1)
+            + (dist_binary.entropy() * binary_valid).sum(dim=-1)
         )
 
         return log_prob, value, entropy

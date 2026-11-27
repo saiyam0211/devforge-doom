@@ -1,18 +1,9 @@
 #!/usr/bin/env python
-"""Hybrid Imitation Learning (Behavioral Cloning) & PPO Fine-Tuning Pipeline.
+"""Train Spatial-EgoNet from demonstrations collected in ViZDoom.
 
-Curriculum:
-1. Multi-Map Expert Teacher Demonstration Collection across diverse WADs & maps:
-   - Full exit completion trajectories on two_rooms.wad and freedoom2.wad:MAP01
-   - Autonomous raycast door seeking, keycard collection, and combat on other maps
-   - 42-waypoint high-bridge, multi-door, and shotgun guy combat mastery
-2. Recurrent Behavioral Cloning (BC) Pretraining:
-   - 32-step temporal sequences processed through 2-layer Spatial GRU
-   - Circular 1D-CNN raycast encoder + Multi-Head Entity Attention
-   - Weighted cross-entropy & calibrated BCE for door interaction and combat
-3. Hardened Production Export:
-   - Direct export to submission/weights/agent_weights.pt
-   - Strict compliance with EVALUATION.md (<40ms latency, <2GB VRAM, 1 CPU thread)
+The teacher uses waypoints on the two guided maps and explores other layouts using
+spatial observations. The expanded curriculum samples key and locked-door windows
+more often and reflects sequences left-to-right to diversify recurrent training.
 """
 
 from __future__ import annotations
@@ -86,7 +77,7 @@ class DoomExpertTeacher:
                 # 2. Shotgun pickup & Door 1
                 (448.0, -160.0),   # Shotgun
                 (544.0, -160.0),
-                (704.0, -160.0),   # Door 1 (Line 167)
+                (704.0, -160.0),   # Door 1 (Line 167) [Index 8]
                 (760.0, -160.0),
                 # 3. High North Bridge across Courtyard
                 (800.0, 0.0),
@@ -102,34 +93,34 @@ class DoomExpertTeacher:
                 (1664.0, -80.0),
                 (1736.0, -88.0),   # Stimpack
                 (1792.0, -160.0),
-                (1824.0, -160.0),  # Door 2 (Line 332)
-                # 5. Long South Corridor (with alcove check)
-                (1952.0, -40.0),   # Clear North alcove ShotgunGuy
+                (1824.0, -160.0),  # Door 2 (Line 332) [Index 22]
+                # 5. Long South Corridor
+                (1950.0, -200.0),
                 (1950.0, -400.0),
                 (1950.0, -700.0),
-                (1930.0, -830.0),  # Top of curved staircase
+                (1930.0, -830.0),  # Top of curved staircase [Index 26]
                 # 6. Curving Downwards Staircase into Lower Corridor
-                (1870.0, -860.0),
+                (1870.0, -860.0),  # [Index 27]
                 (1800.0, -860.0),
                 (1740.0, -856.0),
                 (1680.0, -856.0),
-                (1600.0, -856.0),  # Clear corner blocking wall at x=1696
+                (1600.0, -856.0),  # Clear corner blocking wall at x=1696 [Index 31]
                 # 7. Lower West Corridor
-                (1550.0, -950.0),
-                (1400.0, -1000.0),
+                (1550.0, -950.0),  # [Index 32]
+                (1400.0, -1000.0), # [Index 33]
                 (1200.0, -1024.0),
                 (900.0, -1024.0),
                 (672.0, -1024.0),
-                (648.0, -1024.0),  # Door 3 (Line 876)
+                (648.0, -1024.0),  # Door 3 (Line 876) [Index 37]
                 (608.0, -1024.0),
                 # 8. Hallway to Exit Booth (smooth cornering & centered entrance)
                 (450.0, -1024.0),
                 (320.0, -1024.0),
-                (240.0, -980.0),
+                (240.0, -980.0),   # Diagonally cut corner into exit corridor [Index 41]
                 (216.0, -880.0),
                 (216.0, -740.0),
                 (216.0, -670.0),
-                (216.0, -636.0),   # Exit Switch (Line 774)
+                (216.0, -636.0),   # Exit Switch (Line 774) [Index 45]
             ]
         else:
             base_wp = []
@@ -137,12 +128,12 @@ class DoomExpertTeacher:
         if jitter and base_wp:
             self.waypoints = []
             for i, (wx, wy) in enumerate(base_wp):
-                # Never jitter critical door thresholds or the exit switch itself
-                if ("two_rooms" in self.wad_name and i in (1, 5)) or ("freedoom2" in self.wad_name and i in (8, 22, 37, 43)):
+                # Never jitter critical door thresholds, narrow staircase, or the exit switch itself
+                if ("two_rooms" in self.wad_name and i in (1, 5)) or ("freedoom2" in self.wad_name and (i in (8, 22, 37, 44, 45) or 26 <= i <= 34)):
                     self.waypoints.append((wx, wy))
                 else:
-                    jx = float(np.clip(np.random.normal(0, 8.0), -14.0, 14.0))
-                    jy = float(np.clip(np.random.normal(0, 8.0), -14.0, 14.0))
+                    jx = float(np.clip(np.random.normal(0, 4.0), -8.0, 8.0))
+                    jy = float(np.clip(np.random.normal(0, 4.0), -8.0, 8.0))
                     self.waypoints.append((wx + jx, wy + jy))
         else:
             self.waypoints = base_wp
@@ -210,20 +201,30 @@ class DoomExpertTeacher:
                         act[4] = 0
 
                     # Throttle gating: do not run into enemy face, but keep pressure
-                    if e_dist < 64.0:
+                    if e_dist < 140.0:
                         act[0] = 0
-                        act[1] = 1
+                        if e_dist < 80.0:
+                            act[1] = 1
                     elif abs(angle_diff) < 35.0:
                         act[0] = 1
 
-                    # Fire weapon when target is centered in FOV
-                    if e_cos > 0.5 and abs(e_sin) < 0.28:
+                    # Safety Check: NEVER fire if an explosive barrel (type 10) is nearby
+                    has_barrel = any(
+                        mask[j] == 1 and types[j] == 10 and (
+                            (feats[j, 0] * 1024.0 < 160.0) or
+                            (feats[j, 0] * 1024.0 < 350.0 and feats[j, 2] > 0.4 and abs(feats[j, 1]) < 0.35)
+                        )
+                        for j in range(len(mask))
+                    )
+
+                    # Fire weapon when target is centered in FOV and safe
+                    if not has_barrel and e_cos > 0.4 and abs(e_sin) < 0.28:
                         act[6] = 1
 
             # Door & Switch interaction
             front_d = obs["rays"]["distance"][0]
             hits = obs["rays"]["hit_type"]
-            is_door_ahead = hits[0] in (2, 3) or hits[63] in (2, 3) or hits[1] in (2, 3)
+            is_door_ahead = hits[0] in (2, 3) or hits[63] in (2, 3) or hits[1] in (2, 3) or hits[2] in (2, 3) or hits[62] in (2, 3)
 
             # Special door/switch trigger positions
             if "two_rooms" in self.wad_name:
@@ -237,8 +238,8 @@ class DoomExpertTeacher:
                     if self.use_cooldown == 0:
                         act[7] = 1
                         self.use_cooldown = 10
-                # Exit switch: waypoint >= 42 (Line 774)
-                elif self.wp_idx >= 42 and dist < 85.0:
+                # Exit switch: waypoint >= 44 (Line 774)
+                elif self.wp_idx >= 44 and dist < 85.0:
                     if self.use_cooldown == 0:
                         act[7] = 1
                         self.use_cooldown = 2
@@ -257,6 +258,13 @@ class DoomExpertTeacher:
         # =========================================================================
         # Case 2: Autonomous Generalized Navigation (Unseen & Arbitrary Maps)
         # =========================================================================
+        self.use_cooldown = max(0, self.use_cooldown - 1)
+        if self.door_timer:
+            self.door_timer -= 1
+            act[0] = 1
+            self.last_act_fwd = 1
+            return act
+
         # Stuck detection
         if self.last_act_fwd and (vel_fwd < 0.5 or front_d < 0.08) and self.step_idx > 5:
             self.stuck_steps += 1
@@ -315,27 +323,22 @@ class DoomExpertTeacher:
                 return act
 
         # C. Door Interaction & Aperture Passage
-        door_rays = [r for r in list(range(58, 64)) + list(range(0, 7)) if hits[r] in (2, 3)]
+        has_key = vitals[8:14].any()
+        door_rays = [
+            r for r in (*range(58, 64), *range(7))
+            if hits[r] == 2 or (hits[r] == 3 and has_key)
+        ]
         if door_rays:
             min_door_d = min(rays[r] for r in door_rays)
             best_door_r = min(door_rays, key=lambda r: rays[r])
-            if min_door_d < 0.08:
-                act[7] = 1
-                self.door_timer = 4
-            else:
-                act[0] = 1
-                if best_door_r != 0:
-                    if best_door_r < 32:
-                        act[4] = 1
-                    else:
-                        act[5] = 1
-                self.last_act_fwd = act[0]
-                return act
-
-        if self.door_timer > 0:
-            self.door_timer -= 1
             act[0] = 1
-            self.last_act_fwd = act[0]
+            if best_door_r not in (63, 0, 1):
+                act[4 if best_door_r < 32 else 5] = 1
+            elif min_door_d < 0.055 and self.use_cooldown == 0:
+                act[7] = 1
+                self.use_cooldown = 12
+                self.door_timer = 10
+            self.last_act_fwd = 1
             return act
 
         # D. Tactical Combat: Aim, Fire, and Strafe-Dodge Visible Monsters
@@ -394,16 +397,50 @@ class DoomExpertTeacher:
 # 2. Expert Trajectory Dataset
 # -----------------------------------------------------------------------------
 class DoomTrajectoryDataset(Dataset):
-    def __init__(self, sequences: List[Dict[str, np.ndarray]], seq_len: int = 32):
+    def __init__(self, sequences: List[Dict[str, np.ndarray]], seq_len: int = 32, diversify: bool = False,
+                 include_short: bool = False):
         self.sequences = sequences
         self.seq_len = seq_len
-        self.indices: List[Tuple[int, int]] = []
+        self.diversify = diversify
+        self.include_short = include_short
 
+        # Keep starter-map practice without letting it dominate the expanded curriculum.
+        map_indices: Dict[str, List[Tuple[int, int]]] = {}
         for s_idx, seq in enumerate(sequences):
+            m_key = "two_rooms" if "two_rooms" in seq.get("wad_name", "") else "freedoom"
+            if m_key not in map_indices:
+                map_indices[m_key] = []
             n_steps = len(seq["actions"])
             stride = max(1, seq_len // 2)
-            for t in range(0, n_steps - seq_len + 1, stride):
-                self.indices.append((s_idx, t))
+            starts = list(range(0, n_steps - seq_len + 1, stride))
+            if include_short and 0 < n_steps < seq_len:
+                starts = [0]
+                if diversify:
+                    # Give the terminal actions in short exit clips a second pass.
+                    starts.append(max(0, 2 * n_steps - seq_len))
+            elif diversify and starts and starts[-1] != n_steps - seq_len:
+                starts.append(n_steps - seq_len)
+            for t in starts:
+                map_indices[m_key].append((s_idx, t))
+                if diversify:
+                    window = slice(t, t + seq_len)
+                    sees_key = (seq["ent_type"][window] == 9).any()
+                    at_lock = (seq["ray_hit"][window, 0] == 3).any()
+                    if sees_key or (at_lock and seq["vitals"][window, 8:14].any()):
+                        map_indices[m_key].extend([(s_idx, t)] * 2)
+
+        max_count = max(len(idxs) for idxs in map_indices.values()) if map_indices else 0
+        self.indices: List[Tuple[int, int]] = []
+        for m_key, idxs in map_indices.items():
+            if not idxs:
+                continue
+            count = max_count
+            if diversify:
+                count = max(len(idxs), max_count // 4) if m_key == "two_rooms" else len(idxs)
+            reps = (count + len(idxs) - 1) // len(idxs)
+            balanced_idxs = (idxs * reps)[:count]
+            self.indices.extend(balanced_idxs)
+            print(f"  [Dataset] {m_key}: {len(idxs)} original windows -> balanced to {len(balanced_idxs)}")
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -413,7 +450,7 @@ class DoomTrajectoryDataset(Dataset):
         seq = self.sequences[s_idx]
         end = start + self.seq_len
 
-        return {
+        sample = {
             "ray_dist": torch.from_numpy(seq["ray_dist"][start:end]).float(),
             "ray_hit": torch.from_numpy(seq["ray_hit"][start:end]).long(),
             "ent_feat": torch.from_numpy(seq["ent_feat"][start:end]).float(),
@@ -422,10 +459,32 @@ class DoomTrajectoryDataset(Dataset):
             "vitals": torch.from_numpy(seq["vitals"][start:end]).float(),
             "actions": torch.from_numpy(seq["actions"][start:end]).long(),
         }
+        if "rgb" in seq:
+            sample["rgb"] = torch.from_numpy(seq["rgb"][start:end])
+        if self.diversify and torch.rand(()).item() < 0.5:
+            # Reflect the entire recurrent window in ego space.
+            for name in ("ray_dist", "ray_hit"):
+                sample[name] = sample[name].flip(-1).roll(1, dims=-1)
+            sample["ent_feat"] = sample["ent_feat"].clone()
+            sample["ent_feat"][..., [1, 4]] *= -1
+            sample["vitals"] = sample["vitals"].clone()
+            sample["vitals"][..., 15] *= -1
+            sample["actions"] = sample["actions"][..., [0, 1, 3, 2, 5, 4, 6, 7, 8]]
+            if "rgb" in sample:
+                sample["rgb"] = sample["rgb"].flip(-2)
+        if self.include_short:
+            frames = len(sample["actions"])
+            if frames < self.seq_len:
+                sample = {name: torch.cat((data, data[-1:].expand(self.seq_len - frames, *data.shape[1:])))
+                          for name, data in sample.items()}
+            sample["valid"] = torch.arange(self.seq_len) < frames
+        return sample
 
 
 def collect_demonstrations(
     maps_config: List[Tuple[str, str, int]],
+    diversify: bool = False,
+    use_rgb: bool = False,
 ) -> List[Dict[str, np.ndarray]]:
     """Collects multi-map expert demonstrations using the teacher policy."""
     teacher = DoomExpertTeacher()
@@ -437,13 +496,15 @@ def collect_demonstrations(
     for wad_path, map_name, target_episodes in maps_config:
         wad_name = Path(wad_path).name
         try:
-            env = DoomEnv(wad_path, map_name)
+            env = DoomEnv(wad_path, map_name, render_buffers=use_rgb)
         except Exception as e:
             print(f"  Skipping {wad_name}:{map_name} ({e})")
             continue
 
         is_guided = "two_rooms" in wad_name or map_name == "MAP01"
         ep_completed = 0
+        key_episodes = 0
+        map_exits = 0
         attempts = 0
         max_attempts = target_episodes * 4
 
@@ -457,10 +518,13 @@ def collect_demonstrations(
             ray_dists, ray_hits = [], []
             ent_feats, ent_types, ent_masks = [], [], []
             vitals_list, actions_list = [], []
+            rgb_frames = []
             exit_flag = False
+            visited = set()
 
             for step in range(525):
                 priv = env.privileged_state()
+                visited.add((int(priv["x"] // 128), int(priv["y"] // 128)))
                 act = teacher.act(obs, priv)
 
                 ray_dists.append(obs["rays"]["distance"])
@@ -470,6 +534,8 @@ def collect_demonstrations(
                 ent_masks.append(obs["visible_entities"]["mask"])
                 vitals_list.append(obs["vitals"])
                 actions_list.append(act)
+                if use_rgb:
+                    rgb_frames.append(obs["rgb"][1::4, 1::4].copy())
 
                 obs, r, term, trunc, info = env.step(act)
                 total_steps += 1
@@ -481,13 +547,17 @@ def collect_demonstrations(
                 if term or trunc:
                     break
 
-            # Strictly filter for expert success:
-            # Guided maps require reaching the level exit (exit_flag == True).
-            # Autonomous exploration maps require surviving >= 150 steps.
+            # Require an exit on guided maps and keep evidence of progress on expanded maps.
             valid = exit_flag if is_guided else (len(actions_list) >= 150)
-            if valid and len(actions_list) >= 16:
+            final = env.privileged_state()
+            if diversify and not is_guided:
+                valid = exit_flag or bool(final["keys"].any()) or (len(visited) >= 8 and final["kills"] >= 2)
+            if valid and len(actions_list) >= (24 if diversify else 16):
                 ep_completed += 1
+                map_exits += int(exit_flag)
+                key_episodes += int(final["keys"].any())
                 seq = {
+                    "wad_name": wad_name,
                     "ray_dist": np.array(ray_dists, dtype=np.float32),
                     "ray_hit": np.array(ray_hits, dtype=np.int64),
                     "ent_feat": np.array(ent_feats, dtype=np.float32),
@@ -496,12 +566,15 @@ def collect_demonstrations(
                     "vitals": np.array(vitals_list, dtype=np.float32),
                     "actions": np.array(actions_list, dtype=np.int8),
                 }
+                if use_rgb:
+                    seq["rgb"] = np.stack(rgb_frames)
                 demonstrations.append(seq)
 
         env.close()
-        print(f"  ✓ {wad_name}:{map_name} collected {ep_completed} episodes | Exits so far: {total_exits}")
+        print(f"  {wad_name}:{map_name}: {ep_completed}/{attempts} demonstrations, "
+              f"{map_exits} exits, {key_episodes} with keys")
 
-    print(f"\nTotal Expert Transitions: {total_steps} | Total Exits Reached: {total_exits}\n")
+    print(f"\nTeacher environment steps: {total_steps} | Exits during collection: {total_exits}\n")
     return demonstrations
 
 
@@ -515,18 +588,24 @@ def train_behavioral_cloning(
     batch_size: int = 32,
     lr: float = 6e-4,
     device: str = "cpu",
+    diversify: bool = False,
+    sequence_length: int | None = None,
+    include_short: bool = False,
 ) -> SpatialEgoNet:
     print(f"[2/3] Training Spatial-EgoNet with Behavioral Cloning ({epochs} epochs on {device})...")
-    dataset = DoomTrajectoryDataset(demonstrations, seq_len=32)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    dataset = DoomTrajectoryDataset(demonstrations, seq_len=sequence_length or (24 if diversify else 32),
+                                    diversify=diversify, include_short=include_short)
+    if not len(dataset):
+        raise ValueError("No complete training windows were collected")
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     model.to(device)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
-    # Class weights for binary actions: ATTACK (pos_weight 3.0), USE (pos_weight 6.0), WEAPON (pos_weight 0.2)
-    bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([3.0, 6.0, 0.2]).to(device))
+    # Class weights for binary actions: ATTACK (pos_weight 3.0), USE (pos_weight 3.0), WEAPON (pos_weight 0.2)
+    bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([3.0, 3.0, 0.2]).to(device))
     weight_fb = torch.tensor([1.2, 1.0, 1.2]).to(device)
     weight_turn = torch.tensor([0.8, 1.2, 1.2]).to(device)
 
@@ -557,6 +636,8 @@ def train_behavioral_cloning(
                 },
                 "vitals": b["vitals"].view(B * T, 17).to(device),
             }
+            if model.use_rgb:
+                obs_b["rgb"] = b["rgb"].reshape(B * T, 30, 40, 3).to(device)
 
             features = model.extract_features(obs_b)
             features_seq = features.view(B, T, -1)
@@ -565,6 +646,11 @@ def train_behavioral_cloning(
             h0 = model.initial_hidden_state(batch_size=B, device=device)
             gru_out, _ = model.gru(features_seq, h0)
             rnn_feats = gru_out.contiguous().view(B * T, -1)
+            actions = b["actions"].view(B * T, 9).to(device)
+            if include_short:
+                valid = b["valid"].flatten().to(device)
+                rnn_feats = rnn_feats[valid]
+                actions = actions[valid]
 
             # Action Heads
             logits_fb = model.head_move_fb(rnn_feats)
@@ -573,17 +659,15 @@ def train_behavioral_cloning(
             logits_bin = model.head_binary(rnn_feats)
 
             # Targets
-            actions = b["actions"].view(B * T, 9).to(device)
-
-            target_fb = torch.zeros(B * T, dtype=torch.long, device=device)
+            target_fb = torch.zeros(len(actions), dtype=torch.long, device=device)
             target_fb[actions[:, 0] == 1] = 1
             target_fb[actions[:, 1] == 1] = 2
 
-            target_lr = torch.zeros(B * T, dtype=torch.long, device=device)
+            target_lr = torch.zeros(len(actions), dtype=torch.long, device=device)
             target_lr[actions[:, 2] == 1] = 1
             target_lr[actions[:, 3] == 1] = 2
 
-            target_turn = torch.zeros(B * T, dtype=torch.long, device=device)
+            target_turn = torch.zeros(len(actions), dtype=torch.long, device=device)
             target_turn[actions[:, 4] == 1] = 1
             target_turn[actions[:, 5] == 1] = 2
 
@@ -630,25 +714,42 @@ def main():
     parser = argparse.ArgumentParser(description="Hybrid Behavioral Cloning DOOM Pipeline")
     parser.add_argument("--device", type=str, default="mps" if torch.backends.mps.is_available() else "cpu")
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--expanded", action="store_true", help="Expand the curriculum and mirror demonstrations")
+    parser.add_argument("--warm-start", type=Path)
+    parser.add_argument("--output", type=Path, default=ROOT / "submission/weights/agent_weights.pt")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--threads", type=int, default=1)
     args = parser.parse_args()
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.set_num_threads(args.threads)
 
     two_rooms_path = str((ROOT / "maps" / "two_rooms.wad").resolve())
     freedoom2_path = IWAD
 
     # Curricula: (WAD path, Map name, Target episodes)
-    # Balanced curriculum: High exit ratio on two_rooms and freedoom2 MAP01 across varied seeds
+    # Focused high-quality curriculum: 100% exit completion on two_rooms and freedoom2 MAP01 across varied seeds
     training_curricula = [
-        (two_rooms_path, "MAP01", 20),
-        (freedoom2_path, "MAP01", 35),
-        (freedoom2_path, "MAP02", 8),
-        (freedoom2_path, "MAP03", 8),
+        (two_rooms_path, "MAP01", 25),
+        (freedoom2_path, "MAP01", 50),
     ]
+    if args.expanded:
+        # MAP19/23/26/29/30 are frozen holdouts. MAP25 was previously demoed.
+        training_curricula = [(two_rooms_path, "MAP01", 12), (freedoom2_path, "MAP01", 16)]
+        training_curricula += [
+            (freedoom2_path, f"MAP{number:02d}", 3)
+            for number in (2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 15, 17, 18, 20, 22, 24, 27, 28)
+        ]
+        training_curricula.append((str(ROOT / "tests/fixtures/e7ab54fb6834ffa3.wad"), "MAP01", 6))
 
     # 1. Collect Demonstrations
-    demonstrations = collect_demonstrations(training_curricula)
+    demonstrations = collect_demonstrations(training_curricula, diversify=args.expanded)
 
     # 2. Instantiate Spatial-EgoNet Architecture
     model = SpatialEgoNet(hidden_dim=256, num_gru_layers=2)
+    if args.warm_start:
+        checkpoint = torch.load(args.warm_start, map_location="cpu", weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"])
 
     # 3. Supervised Behavioral Cloning
     model = train_behavioral_cloning(
@@ -656,12 +757,13 @@ def main():
         demonstrations=demonstrations,
         epochs=args.epochs,
         batch_size=32,
-        lr=6e-4,
+        lr=2e-4 if args.warm_start else 6e-4,
         device=args.device,
+        diversify=args.expanded,
     )
 
     # 4. Save Export Weights directly to submission/weights/agent_weights.pt
-    export_path = ROOT / "submission" / "weights" / "agent_weights.pt"
+    export_path = args.output
     export_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Move to CPU for universal serialization
@@ -673,6 +775,8 @@ def main():
             "num_gru_layers": 2,
             "timestamp": time.time(),
             "arch": "Spatial-EgoNet-EgoCentric-Spatial-Encoding",
+            "training_maps": [(Path(wad).name, name) for wad, name, _ in training_curricula],
+            "training_seed": args.seed,
         },
         export_path,
     )

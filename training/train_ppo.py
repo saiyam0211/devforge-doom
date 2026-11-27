@@ -34,7 +34,7 @@ except ImportError:
 
 from doom_env import make_env
 from training.curriculum import CURRICULUM_STAGES, CurriculumManager, TrainingPhase
-from training.rewards import DoomRewardShaper
+from training.rewards import DoomRewardShaper, ProgressReward
 
 
 def resolve_wad_path(wad_name_or_path: str) -> str:
@@ -195,7 +195,7 @@ class PPOTrainer:
 
 def collect_rollout(
     env,
-    shaper: DoomRewardShaper,
+    shaper: DoomRewardShaper | ProgressReward,
     trainer: PPOTrainer,
     curr_obs: Dict,
     curr_hidden: torch.Tensor,
@@ -219,7 +219,9 @@ def collect_rollout(
     episode_rewards = []
     current_ep_return = 0.0
 
-    shaper.reset(curr_obs)
+    track_progress = isinstance(shaper, ProgressReward)
+    if not track_progress:
+        shaper.reset(curr_obs)
 
     for step in range(rollout_len):
         # Format single-observation tensors
@@ -246,7 +248,10 @@ def collect_rollout(
         done = terminated or truncated
 
         # Shaped reward computation
-        shaped_r, _ = shaper.shape(next_obs, action_np, env_reward, done, info)
+        if track_progress:
+            shaped_r = shaper.step(env.privileged_state())
+        else:
+            shaped_r, _ = shaper.shape(next_obs, action_np, env_reward, done, info)
         current_ep_return += env_reward
 
         # Buffer storage
@@ -268,7 +273,7 @@ def collect_rollout(
             current_ep_return = 0.0
             next_obs, info = env.reset()
             curr_hidden = trainer.model.initial_hidden_state(batch_size=1, device=device)
-            shaper.reset(next_obs)
+            shaper.reset(env.privileged_state() if track_progress else next_obs)
         else:
             curr_hidden = next_hidden
 
@@ -344,6 +349,10 @@ def run_training_loop(
     device: str = "cpu",
     output_weights: Optional[Path] = None,
     trainer: Optional[PPOTrainer] = None,
+    progression: bool = False,
+    episode_ticks: int = 2100,
+    seed: int | None = None,
+    export: bool = True,
 ) -> PPOTrainer:
     """Executes vectorized PPO training loop with progressive evaluation logging."""
     wad_path = resolve_wad_path(wad_name)
@@ -353,15 +362,17 @@ def run_training_loop(
     print(f" Steps: {total_steps} | Rollout: {rollout_len} | Device: {device}")
     print(f"=======================================================")
 
-    env = make_env(wad_path, map_name, episode_ticks=2100)
+    env = make_env(wad_path, map_name, episode_ticks=episode_ticks)
     weights_file = output_weights or (ROOT / "submission" / "weights" / "agent_weights.pt")
     if trainer is None:
         trainer = PPOTrainer(device=device)
         if weights_file.is_file():
             trainer.load_checkpoint(weights_file)
 
-    shaper = DoomRewardShaper()
-    curr_obs, _ = env.reset()
+    shaper = ProgressReward() if progression else DoomRewardShaper()
+    curr_obs, _ = env.reset(seed=seed)
+    if progression:
+        shaper.reset(env.privileged_state())
     curr_hidden = trainer.model.initial_hidden_state(batch_size=1, device=trainer.device)
 
     num_iterations = max(1, total_steps // rollout_len)
@@ -431,11 +442,13 @@ def run_training_loop(
         )
 
     env.close()
-    trainer.save_checkpoint(weights_file)
+    if export:
+        trainer.save_checkpoint(weights_file)
 
     total_time = time.time() - start_time
     print(f"\n[Training Complete] {total_steps_done} steps finished in {total_time:.1f}s.")
-    print(f"[Training Complete] Policy weights exported to: {weights_file}")
+    if export:
+        print(f"[Training Complete] Policy weights exported to: {weights_file}")
     return trainer
 
 

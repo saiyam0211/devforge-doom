@@ -138,3 +138,36 @@ class DoomRewardShaper:
 
         self.last_vitals = np.copy(vitals)
         return float(reward), breakdown
+
+
+class ProgressReward:
+    """Training reward from actual game events, with novelty paid once per episode."""
+
+    def reset(self, state: Dict) -> None:
+        self.previous = state
+        self.visited = {self.cell(state)}
+        self.opened = set(np.flatnonzero(self.open_locks(state)))
+
+    @staticmethod
+    def cell(state: Dict) -> tuple[int, int]:
+        return int(state["x"] // 64), int(state["y"] // 64)
+
+    @staticmethod
+    def open_locks(state: Dict) -> np.ndarray:
+        return (state["door_lock"] > 0) & (state["sector_ceiling"] - state["sector_floor"] >= 56)
+
+    def step(self, state: Dict) -> float:
+        cell = self.cell(state)
+        available = set(np.flatnonzero(self.open_locks(state)))
+        keys = int(np.count_nonzero(state["keys"] > self.previous["keys"]))
+        reward = (
+            -0.008 + 0.12 * (cell not in self.visited)
+            + 2.5 * keys + 2.0 * len(available - self.opened)
+            + 0.35 * max(0, state["kills"] - self.previous["kills"])
+            - 0.018 * max(0, self.previous["health"] - state["health"])
+            + 12.0 * state["exit_reached"] - 1.0 * state["dead"]
+        )
+        self.visited.add(cell)
+        self.opened.update(available)
+        self.previous = state
+        return float(reward)
